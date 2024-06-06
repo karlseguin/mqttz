@@ -1,0 +1,7 @@
+.{
+  .name = "mqttz",
+  .paths = .{""},
+  .version = "0.0.0",
+  .dependencies = .{
+  },
+}
