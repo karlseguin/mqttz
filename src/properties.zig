@@ -1,3 +1,4 @@
+const mqtt = @import("mqtt.zig");
 const codec = @import("codec.zig");
 
 pub const PropertyType = enum(u8) {
@@ -31,7 +32,7 @@ pub const PropertyType = enum(u8) {
 };
 
 pub const Property = union(PropertyType) {
-	payload_format: u8,
+	payload_format: mqtt.PayloadFormat,
 	message_expiry_interval: u32,
 	content_type: []const u8,
 	response_topic: []const u8,
@@ -44,7 +45,7 @@ pub const Property = union(PropertyType) {
 	server_keepalive: u16,
 	authentication_method: []const u8,
 	authentication_data: []const u8,
-	request_problem_information: u8,
+	request_problem_information: bool,
 	delay_interval: u32,
 	request_response_information: u8,
 	response_information: []const u8,
@@ -53,13 +54,13 @@ pub const Property = union(PropertyType) {
 	receive_maximum: u16,
 	topic_alias_maximum: u16,
 	topic_alias: u16,
-	maximum_qos: u8,
-	retain_available: u8,
+	maximum_qos: mqtt.QoS,
+	retain_available: bool,
 	user_property: []const u8,
 	maximum_packet_size: u32,
-	wildcard_subscription_available: u8,
-	subscription_identifier_available: u8,
-	shared_subscription_available: u8,
+	wildcard_subscription_available: bool,
+	subscription_identifier_available: bool,
+	shared_subscription_available: bool,
 };
 
 // Given an struct, like ConnectOpts, extracts the property fields determines,
@@ -222,11 +223,11 @@ pub const Reader = struct {
 
 fn readValue(comptime T: type, buf: []u8) !struct{T, usize} {
 	switch (T) {
-		u8 => {
-			if (buf.len == 0) {
+		bool => {
+			if (buf.len == 0 or buf[0] > 1) {
 				return error.InvalidPropertyValue;
 			}
-			return .{buf[0], 1};
+			return .{buf[0] == 1 , 1};
 		},
 		u16 => {
 			if (buf.len < 2) {
@@ -257,6 +258,23 @@ fn readValue(comptime T: type, buf: []u8) !struct{T, usize} {
 		usize => {
 			const value, const length_of_len = (try codec.readVarint(buf)) orelse return error.InvalidPropertyValue;
 			return .{value, length_of_len};
+		},
+		mqtt.PayloadFormat => {
+			if (buf.len == 0 or buf[0] > 1) {
+				return error.InvalidPropertyValue;
+			}
+			return .{if (buf[0] == 0) .unspecified else .utf8 , 1};
+		},
+		mqtt.QoS => {
+			if (buf.len == 0) {
+				return error.InvalidPropertyValue;
+			}
+			switch (buf[0]) {
+				0 => return .{.at_most_once, 1},
+				1 => return .{.at_least_once, 1},
+				2 => return .{.exactly_once, 1},
+				else => return error.InvalidPropertyValue,
+			}
 		},
 		else => unreachable,
 	}
@@ -325,14 +343,14 @@ test "properties: Reader" {
 	{
 		var r = try Reader.init(@constCast(&[_]u8{
 			19,                           // length, not including self
-			23, 75,                       // request problem info (u8),
+			23, 1,                       // request problem info (u8),
 			19, 0x30, 0x65,               // server keepalive (u16),
 			2, 0x77, 0x35, 0x94, 0x01,    // message_expiry_interval (u32),
 			11, 0x81, 0x0a,               // subscription_identifier (varint (usize)),
 			9, 0, 3, 't', 'e', 'g'        // correlation_data ([]const u8)
 		}));
 		try t.expectEqual(20, r.len);
-		try t.expectEqual(75, (try r.next()).?.request_problem_information);
+		try t.expectEqual(true, (try r.next()).?.request_problem_information);
 		try t.expectEqual(12389, (try r.next()).?.server_keepalive);
 		try t.expectEqual(2000000001, (try r.next()).?.message_expiry_interval);
 		try t.expectEqual(1281, (try r.next()).?.subscription_identifier);

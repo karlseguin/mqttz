@@ -309,7 +309,7 @@ pub fn Client(comptime S: type) type {
 			}
 
 			if (connack.retain_available) |ra| {
-				self.server_can_retain = ra == 1;
+				self.server_can_retain = ra;
 			}
 
 			return connack;
@@ -992,7 +992,7 @@ test "Client: connect" {
 		try t.expectEqual(null, connack.session_expiry_interval);
 		try t.expectEqual(null, connack.receive_maximum);
 		try t.expectEqual(null, connack.maximum_qos);
-		try t.expectEqual(0, connack.retain_available.?);
+		try t.expectEqual(false, connack.retain_available.?);
 		try t.expectEqual(null, connack.maximum_packet_size);
 		try t.expectEqual(null, connack.assigned_client_identifier);
 		try t.expectEqual(null, connack.topic_alias_maximum);
