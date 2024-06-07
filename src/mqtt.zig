@@ -125,7 +125,7 @@ pub const SubscribeOpts = struct {
 
 pub const PublishOpts = struct {
 	message: []const u8,
-	topic_name: []const u8,
+	topic: []const u8,
 	dup: bool = false,
 	qos: QoS = .at_most_once,
 	retain: bool = false,
@@ -249,6 +249,8 @@ pub fn Client(comptime S: type) type {
 		// Many packets take an identifier, we increment this by one on each call
 		packet_identifier: u16,
 
+		server_can_retain: bool,
+
 		const Self = @This();
 
 		pub fn init(state: S, read_buf: []u8, write_buf: []u8) !Self {
@@ -269,6 +271,7 @@ pub fn Client(comptime S: type) type {
 				.last_error = null,
 				.packet_identifier = 1,
 				.disconnected = false, // we assume
+				.server_can_retain = true,  // we'll set this to false if connack says so
 			};
 		}
 
@@ -304,7 +307,10 @@ pub fn Client(comptime S: type) type {
 				self.last_error = .{.details = "connack indicated the presence of a session despite requesting clean_start"};
 				return error.Protocol;
 			}
-			// TODO validate properties
+
+			if (connack.retain_available) |ra| {
+				self.server_can_retain = ra == 1;
+			}
 
 			return connack;
 		}
@@ -335,6 +341,10 @@ pub fn Client(comptime S: type) type {
 		}
 
 		pub fn publish(self: *Self, opts: PublishOpts) ErrorGroup!void {
+			if (opts.retain == true and self.server_can_retain == false) {
+				self.last_error = .{.details = "server does not support retained messages"};
+				return error.Usage;
+			}
 			const packet_identifier = opts.packet_identifier orelse @atomicRmw(u16, &self.packet_identifier, .Add, 1, .monotonic);
 			const publish_packet = encodePublish(self.write_buf, packet_identifier, opts) catch |err| {
 				self.last_error = .{.inner = err};
@@ -642,7 +652,7 @@ fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
 	// reserve 1 byte for the packet type
 	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
 	const VARIABLE_HEADER_OFFSET = 5;
-	const topic_len = try codec.writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic_name);
+	const topic_len = try codec.writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
 
 	const packet_identifer_offset = VARIABLE_HEADER_OFFSET + topic_len;
 	const properties_offset = packet_identifer_offset + 2;
@@ -802,7 +812,7 @@ test "encodePublish: minimal" {
 	// is the smallest that will work
 
 	var buf: [33]u8 = undefined;
-	const encoded = try encodePublish(&buf, 20, .{.topic_name = "power/goku", .message = "over 9000!!"});
+	const encoded = try encodePublish(&buf, 20, .{.topic = "power/goku", .message = "over 9000!!"});
 	try t.expectEqualSlices(u8, &.{
 		48,                        // packet type (0011 0000)  (3 for the packet type, 0 since no flag is set)
 		28,                        // payload length
@@ -817,7 +827,7 @@ test "encodePublish: full" {
 	var buf: [50]u8 = undefined;
 	// need at least 1 topic
 	const encoded = try encodePublish(&buf, 30, .{
-		.topic_name = "t1",
+		.topic = "t1",
 		.message = "m2z",
 		.dup = true,
 		.qos = .exactly_once,
@@ -937,6 +947,10 @@ test "Client: connect" {
 
 		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
 		const connack = try client.connect(.{});
+
+		// the default if the server doesn't send up a retain_available property
+		try t.expectEqual(true, client.server_can_retain);
+
 		try t.expectEqual(0, ctx.close_count);
 		try t.expectEqual(false, connack.session_present);
 		try t.expectEqual(0, connack.reason_code);
@@ -963,18 +977,22 @@ test "Client: connect" {
 		// success
 		// session_present = false
 		// reason code = 0
+		// retain_available = 0
 		// server_keepalive property
-		ctx.reply(&.{32, 6, 0, 0, 3, 19, 0, 60});
+		ctx.reply(&.{32, 8, 0, 0, 5, 19, 0, 60, 37, 0});
 
 		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
 		const connack = try client.connect(.{});
+		// server told us it won't/can't retain
+		try t.expectEqual(false, client.server_can_retain);
 		try t.expectEqual(0, ctx.close_count);
+
 		try t.expectEqual(false, connack.session_present);
 		try t.expectEqual(0, connack.reason_code);
 		try t.expectEqual(null, connack.session_expiry_interval);
 		try t.expectEqual(null, connack.receive_maximum);
 		try t.expectEqual(null, connack.maximum_qos);
-		try t.expectEqual(null, connack.retain_available);
+		try t.expectEqual(0, connack.retain_available.?);
 		try t.expectEqual(null, connack.maximum_packet_size);
 		try t.expectEqual(null, connack.assigned_client_identifier);
 		try t.expectEqual(null, connack.topic_alias_maximum);
@@ -988,7 +1006,7 @@ test "Client: connect" {
 		try t.expectEqual(null, connack.authentication_method);
 		try t.expectEqual(null, connack.authentication_data);
 
-		try t.expectEqualSlices(u8, &.{32, 6, 0, 0, 3, 19, 0, 60}, client.lastReadPacket());
+		try t.expectEqualSlices(u8, &.{32, 8, 0, 0, 5, 19, 0, 60, 37, 0}, client.lastReadPacket());
 	}
 }
 
@@ -1071,6 +1089,22 @@ test "Client: subscribe" {
 		try t.expectEqual(.exactly_once, suback.result(0).granted);
 		try t.expectEqual(.not_authorized, suback.result(1).err);
 		try t.expectEqual(.unknown, suback.result(2).err);
+	}
+}
+
+test "Client: publish" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	{
+		// can't publish with retain if server doesn't support retain
+		// (the server should treat this as an error, so we might as well catch it in the library)
+		ctx.reset();
+		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
+		client.server_can_retain = false;
+		try t.expectError(error.Usage, client.publish(.{.retain = true, .topic = "", .message = ""}));
+		try t.expectEqualSlices(u8, "server does not support retained messages", client.last_error.?.details);
+		try t.expectEqual(0, ctx.close_count);
 	}
 }
 
