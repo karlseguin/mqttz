@@ -93,6 +93,16 @@ pub const SUBSCRIBE = [_]PropertyType{
 	.subscription_identifier,
 };
 
+pub const PUBLISH = [_]PropertyType{
+	.payload_format,
+	.message_expiry_interval,
+	.topic_alias,
+	.response_topic,
+	.correlation_data,
+	.subscription_identifier,
+	.content_type,
+};
+
 pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyType) error{WriteBufferIsFull}!usize {
 	const properties_len = writeLen(value, properties);
 	const length_of_len = codec.lengthOfVarint(properties_len);

@@ -123,6 +123,22 @@ pub const SubscribeOpts = struct {
 	};
 };
 
+pub const PublishOpts = struct {
+	message: []const u8,
+	topic_name: []const u8,
+	dup: bool = false,
+	qos: QoS = .at_most_once,
+	retain: bool = false,
+	packet_identifier: ?u16 = null,
+	payload_format: ?PayloadFormat = null,
+	message_expiry_interval: ?u32 = null,
+	topic_alias: ?u16 = null,
+	response_topic: ?[]const u8 = null,
+	correlation_data: ?[]const u8 = null,
+	subscription_identifier:? usize = null,
+	content_type: ?[]const u8 = null,
+};
+
 // When we call the provided read implementation, we pass a ReadMeta. The goal
 // is to provide additional information to the implementation, in case it needs
 // it. I imagine most implementations won't use this, but the main goal is
@@ -144,6 +160,7 @@ pub const WriteMeta = struct {
 
 	pub const Reason = enum {
 		connect,
+		publish,
 		subscribe,
 		disconnect,
 	};
@@ -315,6 +332,15 @@ pub fn Client(comptime S: type) type {
 			};
 
 			return suback;
+		}
+
+		pub fn publish(self: *Self, opts: PublishOpts) ErrorGroup!void {
+			const packet_identifier = opts.packet_identifier orelse @atomicRmw(u16, &self.packet_identifier, .Add, 1, .monotonic);
+			const publish_packet = encodePublish(self.write_buf, packet_identifier, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(publish_packet, .publish);
 		}
 
 		pub fn disconnect(self: *Self, reason: DisconnectReason, opts: DisconnectOpts) !void {
@@ -602,7 +628,35 @@ fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: SubscribeOpts) ![]u8
 	return finalizePacket(buf[0..pos], 8, 2);
 }
 
+fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
+	var publish_flags = packed struct(u4) {
+		dup: bool,
+		qos: QoS,
+		retain: bool,
+	} {
+		.dup = opts.dup,
+		.qos = opts.qos,
+		.retain = opts.retain,
+	};
+
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	const VARIABLE_HEADER_OFFSET = 5;
+	const topic_len = try codec.writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic_name);
+
+	const packet_identifer_offset = VARIABLE_HEADER_OFFSET + topic_len;
+	const properties_offset = packet_identifer_offset + 2;
+	codec.writeInt(u16, buf[packet_identifer_offset..properties_offset][0..2], packet_identifier);
+	const properties_len = try properties.write(buf[properties_offset..], opts, &properties.PUBLISH);
+
+	const payload_offset = properties_offset + properties_len;
+	const payload_len = try codec.writeString(buf[payload_offset..], opts.message);
+
+	return finalizePacket(buf[0..payload_offset + payload_len], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
+}
+
 fn finalizePacket(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
+
 	const remaining_len = buf.len - 5;
 	const length_of_len = codec.lengthOfVarint(remaining_len);
 
@@ -739,6 +793,47 @@ test "encodeSubscribe: minimal" {
 		0, 6, 't', 'o', 'p', 'i', 'c', '1',
 		36                         // subscription options
 		                           //   by default, do_not_send_retained and no_local are set
+	}, encoded);
+}
+
+test "encodePublish: minimal" {
+	// This packet fits in a [30]u8 ...BUT, because of the way we encode packets
+	// we always reserved 5 leading bytes to deal with the varint lenght, so [33]u8
+	// is the smallest that will work
+
+	var buf: [33]u8 = undefined;
+	const encoded = try encodePublish(&buf, 20, .{.topic_name = "power/goku", .message = "over 9000!!"});
+	try t.expectEqualSlices(u8, &.{
+		48,                        // packet type (0011 0000)  (3 for the packet type, 0 since no flag is set)
+		28,                        // payload length
+		0, 10, 'p', 'o', 'w', 'e', 'r', '/', 'g', 'o', 'k', 'u',
+		0, 20,                     // packet identifier
+		0,                         // property length
+		0, 11, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!' // payload (the message)
+	}, encoded);
+}
+
+test "encodePublish: full" {
+	var buf: [50]u8 = undefined;
+	// need at least 1 topic
+	const encoded = try encodePublish(&buf, 30, .{
+		.topic_name = "t1",
+		.message = "m2z",
+		.dup = true,
+		.qos = .exactly_once,
+		.retain = true,
+		.payload_format = .utf8,
+		.message_expiry_interval = 10
+	});
+	try t.expectEqualSlices(u8, &.{
+		61,                        // packet type (0011 1 10 1)  (3 for the packet type, 1 for dup, 2 for qos, 1 for retain)
+		19,                        // payload length
+		0, 2, 't', '1',
+		0, 30,                     // packet identifier
+		7,                         // property length
+		1, 1,                      //payload format
+		2, 0, 0, 0, 10,            // message expiry interval
+		0, 3, 'm', '2', 'z'        // payload (the message)
 	}, encoded);
 }
 

@@ -133,7 +133,7 @@ test "codec: readVarint" {
 	try t.expectError(error.InvalidVarint, readVarint(&[_]u8{128, 128, 128, 128}));
 }
 
-test "codec: lengthOfVarin"  {
+test "codec: lengthOfVarint"  {
 	try t.expectEqual(1, lengthOfVarint(0));
 	try t.expectEqual(1, lengthOfVarint(127));
 	try t.expectEqual(2, lengthOfVarint(128));
