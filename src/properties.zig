@@ -104,6 +104,10 @@ pub const PUBLISH = [_]PropertyType{
 	.content_type,
 };
 
+pub const PUBACK = [_]PropertyType{
+	.reason_string
+};
+
 pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyType) error{WriteBufferIsFull}!usize {
 	const properties_len = writeLen(value, properties);
 	const length_of_len = codec.lengthOfVarint(properties_len);
@@ -129,13 +133,7 @@ pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyTyp
 					codec.writeInt(u32, buf[pos..end][0..4], v);
 					pos = end;
 				},
-				[]const u8 => {
-					const len_end = pos + 2;
-					codec.writeInt(u16, buf[pos..len_end][0..2], @intCast(v.len));
-					const end = len_end + v.len;
-					@memcpy(buf[len_end..end], v);
-					pos = end;
-				},
+				[]const u8 => pos += try codec.writeString(buf[pos..], v),
 				else => {
 					switch (@typeInfo(@TypeOf(v))) {
 						.Enum => {
@@ -216,7 +214,6 @@ pub const Reader = struct {
 				return @unionInit(Property, field.name, value);
 			}
 		}
-
 		return error.UnknownProperty;
 	}
 };
@@ -241,20 +238,7 @@ fn readValue(comptime T: type, buf: []u8) !struct{T, usize} {
 			}
 			return .{codec.readInt(u32, buf[0..4]), 4};
 		},
-		[]const u8 => {
-			if (buf.len < 2) {
-				return error.InvalidPropertyValue;
-			}
-			const len = codec.readInt(u16, buf[0..2]);
-
-			// + 2 for the length prefix
-			const total_len = 2 + len;
-
-			if (buf.len < total_len) {
-				return error.InvalidPropertyValue;
-			}
-			return .{buf[2..total_len], total_len};
-		},
+		[]const u8 => return codec.readString(buf) catch return error.InvalidPropertyValue,
 		usize => {
 			const value, const length_of_len = (try codec.readVarint(buf)) orelse return error.InvalidPropertyValue;
 			return .{value, length_of_len};

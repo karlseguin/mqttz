@@ -79,6 +79,17 @@ pub const DisconnectReason = enum(u8) {
 	payload_format_invalid = 153,
 };
 
+pub const PubAckReason = enum(u8) {
+	success = 0,
+	no_matching_subscribers = 16,
+	unspecified_error = 128,
+	implementation_specific_error = 131,
+	not_authorized = 135,
+	topic_name_invalid = 144,
+	quota_exceeded = 151,
+	payload_format_invalid = 153,
+};
+
 pub const ConnectOpts = struct {
 	client_id: ?[]const u8 = null,
 	username: ?[]const u8 = null,
@@ -137,6 +148,12 @@ pub const PublishOpts = struct {
 	correlation_data: ?[]const u8 = null,
 	subscription_identifier:? usize = null,
 	content_type: ?[]const u8 = null,
+};
+
+pub const PubAckOpts = struct {
+	packet_identifier: u16,
+	reason_code: PubAckReason = .success,
+	reason_string: ?[]const u8 = null,
 };
 
 // This is my attempt at dealing with Zig's lack of error payload. I'm trying to
@@ -258,6 +275,14 @@ pub fn Mqtt(comptime S: type) type {
 			};
 			try self.writePacket(state, publish_packet);
 			return packet_identifier;
+		}
+
+		pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) error{Encoding, Write}!void {
+			const puback_packet = encodePubAck(self.write_buf, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, puback_packet);
 		}
 
 		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{Encoding, Write}!void {
@@ -482,6 +507,12 @@ pub fn Mqtt(comptime S: type) type {
 	};
 }
 
+const PublishFlags = packed struct(u4) {
+	dup: bool,
+	qos: QoS,
+	retain: bool,
+};
+
 fn encodeConnect(buf: []u8, opts: ConnectOpts) ![]u8 {
 	var connect_flags = packed struct(u8) {
 		_reserved: bool = false,
@@ -583,11 +614,7 @@ fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: SubscribeOpts) ![]u8
 }
 
 fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
-	var publish_flags = packed struct(u4) {
-		dup: bool,
-		qos: QoS,
-		retain: bool,
-	} {
+	var publish_flags = PublishFlags{
 		.dup = opts.dup,
 		.qos = opts.qos,
 		.retain = opts.retain,
@@ -607,6 +634,26 @@ fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
 	const payload_len = try codec.writeString(buf[payload_offset..], opts.message);
 
 	return encodePacketHeader(buf[0..payload_offset + payload_len], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
+}
+
+fn encodePubAck(buf: []u8, opts: PubAckOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBACK);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 64; // packet type (0100) + flags (0000)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 4, 0);
 }
 
 fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
@@ -629,6 +676,8 @@ fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
 pub const Packet = union(enum) {
 	connack: ConnAck,
 	suback: SubAck,
+	publish: Publish,
+	puback: PubAck,
 
 	pub const ConnAck = struct {
 		session_present: bool,
@@ -699,20 +748,49 @@ pub const Packet = union(enum) {
 				}
 			}
 	};
+
+	pub const Publish = struct {
+		dup: bool,
+		qos: QoS,
+		// not sure what this means in the context of a received message
+		// maybe it's never set, or maybe it indicates that the server is publishing
+		// a message which it retains?
+		retain: bool,
+
+		topic: []const u8,
+		message: []const u8,
+		packet_identifier: u16,
+
+		payload_format: ?PayloadFormat = null,
+		message_expiry_interval: ?u32 = null, // does a server ever send this?
+		topic_alias: ?u16 = null,
+		response_topic: ?[]const u8 = null,
+		correlation_data: ?[]const u8 = null,
+		subscription_identifier: ?usize = null,
+		content_type: ?[]const u8 = null,
+	};
+
+	pub const PubAck = struct {
+		packet_identifier: u16,
+		reason_code: PubAckReason,
+		reason_string: ?[]const u8 = null,
+	};
 };
 
-pub fn decodePacket(b1: u8, data: []u8) !Packet {
+fn decodePacket(b1: u8, data: []u8) !Packet {
 	// data.len has to be > 0
 	// TODO: how to assert without std?
-	const flags = b1 & 15;
+	const flags: u4 = @intCast(b1 & 15);
 	switch (b1 >> 4) {
 		2 => return .{.connack = try decodeConnAck(data, flags)},
+		3 => return .{.publish = try decodePublish(data, flags)},
+		4 => return .{.puback = try decodePubAck(data, flags)},
 		9 => return .{.suback = try decodeSubAck(data, flags)},
 		else => return error.UnknownPacketType, // TODO
 	}
 }
 
-pub fn decodeConnAck(data: []u8, flags: u8) !Packet.ConnAck {
+ fn decodeConnAck(data: []u8, flags: u4) !Packet.ConnAck {
 	if (flags != 0) {
 		return error.InvalidFlags;
 	}
@@ -761,7 +839,7 @@ pub fn decodeConnAck(data: []u8, flags: u8) !Packet.ConnAck {
 	return connack;
 }
 
-fn decodeSubAck(data: []u8, flags: u8) !Packet.SubAck {
+fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
 	if (flags != 0) {
 		return error.InvalidFlags;
 	}
@@ -796,6 +874,94 @@ fn decodeSubAck(data: []u8, flags: u8) !Packet.SubAck {
 	return suback;
 }
 
+fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
+	if (data.len < 5) {
+		// 2 for the packet identifier
+		// 1 for an empty property list
+		// 2 for an empty message
+		return error.IncompletePacket;
+	}
+
+	const publish_flags: *PublishFlags = @constCast(@ptrCast(&flags));
+
+	const topic, const packet_identifier_offset = try codec.readString(data);
+	const properties_offset = packet_identifier_offset + 2;
+
+	var publish = Packet.Publish{
+		.dup = publish_flags.dup,
+		.qos = publish_flags.qos,
+		.retain = publish_flags.retain,
+		.topic = topic,
+		.message = undefined,
+		.packet_identifier = codec.readInt(u16, data[packet_identifier_offset..properties_offset][0..2]),
+	};
+
+	var props = try PropertyReader.init(data[properties_offset..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.payload_format => |v| publish.payload_format = v,
+			.message_expiry_interval => |v| publish.message_expiry_interval = v,
+			.topic_alias => |v| publish.topic_alias = v,
+			.response_topic => |v| publish.response_topic = v,
+			.correlation_data => |v| publish.correlation_data = v,
+			.subscription_identifier => |v| publish.subscription_identifier = v,
+			.content_type => |v| publish.content_type = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+
+	publish.message, _ = try codec.readString(data[properties_offset + props.len..]);
+	return publish;
+}
+
+fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
+	if (flags != 0) {
+		return error.InvalidFlags;
+	}
+
+	if (data.len < 2) {
+		return error.IncompletePacket;
+	}
+
+	const packet_identifier = codec.readInt(u16, data[0..2]);
+	if (data.len == 2) {
+		// special puback with just a packet_identifier
+		// reason_code is implicitly success
+		// no properties
+		return .{
+			.reason_code = .success,
+			.packet_identifier = packet_identifier,
+		};
+	}
+
+	const reason_code: PubAckReason = switch (data[2]) {
+		0 => .success,
+		16 => .no_matching_subscribers,
+		128 => .unspecified_error,
+		131 => .implementation_specific_error,
+		135 => .not_authorized,
+		144 => .topic_name_invalid,
+		151 => .quota_exceeded,
+		153 => .payload_format_invalid,
+		else => return error.MalformedPacket,
+	};
+
+	var puback = Packet.PubAck{
+		.packet_identifier = packet_identifier,
+		.reason_code = reason_code,
+	};
+
+	var props = try PropertyReader.init(data[3..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.reason_string => |v| puback.reason_string = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+	return puback;
+}
 
 const t = @import("std").testing;
 
@@ -974,6 +1140,54 @@ test "Client: publish" {
 			1, 1,                      //payload format
 			2, 0, 0, 0, 10,            // message expiry interval
 			0, 3, 'm', '2', 'z'        // payload (the message)
+		});
+	}
+}
+
+test "Client: puback" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// puback special short (success with no properties)
+		ctx.reset();
+		try client.puback(&ctx, .{.packet_identifier = 5});
+
+		try ctx.expectWritten(1, &.{
+			64,                       // packet type (0100 0000)  (4 for the packet type, 0 for flags)
+			2,                        // payload length
+			0, 5                      // packet identifier
+		});
+	}
+
+	{
+		// puback with non-success reason code
+		ctx.reset();
+		try client.puback(&ctx, .{.packet_identifier = 1, .reason_code = .quota_exceeded});
+
+		try ctx.expectWritten(1, &.{
+			64,                       // packet type (0100 0000)  (4 for the packet type, 0 for flags)
+			4,                        // payload length
+			0, 1,                     // packet identifier
+			151,                      // reason code
+			0,                        // properties length
+		});
+	}
+
+	{
+		// puback with properties
+		ctx.reset();
+		try client.puback(&ctx, .{.packet_identifier = 1, .reason_string = "ok"});
+
+		try ctx.expectWritten(1, &.{
+			64,                       // packet type (0100 0000)  (4 for the packet type, 0 for flags)
+			9,                        // payload length
+			0, 1,                     // packet identifier
+			0,                        // reason code
+			5,                        // properties length
+			31, 0, 2, 'o', 'k'
 		});
 	}
 }
@@ -1241,12 +1455,96 @@ test "Client: readPacket suback" {
 	}
 }
 
-// test "Client: publish" {
-// 	var ctx = TestContext.init();
-// 	defer ctx.deinit();
+test "Client: readPacket publish" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
 
 
-// }
+	{
+		// short packet
+		ctx.reset();
+		ctx.reply(&.{48, 4, 0, 0, 0, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// basic response
+		ctx.reset();
+		ctx.reply(&.{
+			48,
+			15,
+			0, 3, 'a', '/', 'b',      // topic
+			10, 1,                    // packet identifier
+			0,                        // property list length
+			0, 5, 'h', 'e', 'l', 'l', 'o'  // payload (message)
+		});
+		const publish = (try client.readPacket(&ctx)).publish;
+		try t.expectEqual(.at_most_once, publish.qos);
+		try t.expectEqual(false, publish.dup);
+		try t.expectEqual(false, publish.retain);
+		try t.expectEqual(2561, publish.packet_identifier);
+		try t.expectEqualSlices(u8, "a/b", publish.topic);
+		try t.expectEqualSlices(u8, "hello", publish.message);
+
+		try t.expectEqual(null, publish.payload_format);
+		try t.expectEqual(null, publish.message_expiry_interval);
+		try t.expectEqual(null, publish.topic_alias);
+		try t.expectEqual(null, publish.response_topic);
+		try t.expectEqual(null, publish.correlation_data);
+		try t.expectEqual(null, publish.subscription_identifier);
+		try t.expectEqual(null, publish.content_type);
+	}
+}
+
+test "Client: readPacket puback" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+
+	{
+		// short packet
+		ctx.reset();
+		ctx.reply(&.{64, 1, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			64,
+			2,
+			10, 2,                    // packet identifier
+		});
+		const puback = (try client.readPacket(&ctx)).puback;
+		try t.expectEqual(2562, puback.packet_identifier);
+		try t.expectEqual(.success, puback.reason_code);
+		try t.expectEqual(null, puback.reason_string);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			64,
+			11,
+			0, 3,                    // packet identifier
+			135,                     // reason code
+			7,                       // properties length
+			31, 0, 4, 'n', 'o', 'p', 'e'
+		});
+		const puback = (try client.readPacket(&ctx)).puback;
+		try t.expectEqual(3, puback.packet_identifier);
+		try t.expectEqual(.not_authorized, puback.reason_code);
+		try t.expectEqualSlices(u8, "nope", puback.reason_string.?);
+	}
+}
 
 const TestContext = struct {
 	arena: *std.heap.ArenaAllocator,

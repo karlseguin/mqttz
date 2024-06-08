@@ -16,6 +16,18 @@ pub fn writeVarint(buf: []u8, len: usize) usize {
 	}
 }
 
+pub fn writeString(buf: []u8, value: []const u8) error{WriteBufferIsFull}!usize {
+	const total = value.len + 2;
+	if (buf.len < total) {
+		return error.WriteBufferIsFull;
+	}
+
+	writeInt(u16, buf[0..2], @intCast(value.len));
+	@memcpy(buf[2..total], value);
+	return total;
+}
+
+
 // This returns the varint value (if we have one) AND the length of the varint
 pub fn readVarint(buf: []const u8) error{InvalidVarint}!?struct{usize, usize} {
 	if (buf.len == 0) {
@@ -69,20 +81,21 @@ pub inline fn writeInt(comptime T: type, buf: *[@divExact(@typeInfo(T).Int.bits,
 	buf.* = @bitCast(if (native_endian == .big) value else @byteSwap(value));
 }
 
-pub inline fn readInt(comptime T: type, buf: *[@divExact(@typeInfo(T).Int.bits, 8)]u8) T {
+pub inline fn readInt(comptime T: type, buf: *const [@divExact(@typeInfo(T).Int.bits, 8)]u8) T {
 	const value: T = @bitCast(buf.*);
 	return if (native_endian == .big) value else @byteSwap(value);
 }
 
-pub fn writeString(buf: []u8, value: []const u8) error{WriteBufferIsFull}!usize {
-	const total = value.len + 2;
-	if (buf.len < total) {
-		return error.WriteBufferIsFull;
+pub fn readString(buf: []const u8) error{InvalidString}!struct{[]const u8, usize} {
+	if (buf.len < 2) {
+		return error.InvalidString;
 	}
-
-	writeInt(u16, buf[0..2], @intCast(value.len));
-	@memcpy(buf[2..total], value);
-	return total;
+	const len = readInt(u16, buf[0..2]);
+	const end = len + 2;
+	if (buf.len < end) {
+		return error.InvalidString;
+	}
+	return .{buf[2..end], end};
 }
 
 const t = @import("std").testing;
@@ -98,6 +111,27 @@ test "codec: writeVarint" {
 	try t.expectEqualSlices(u8, &[_]u8{0xff, 0xff, 0x7f}, buf[0..writeVarint(&buf, 2097151)]);
 	try t.expectEqualSlices(u8, &[_]u8{0x80, 0x80, 0x80, 0x01}, buf[0..writeVarint(&buf, 2097152)]);
 	try t.expectEqualSlices(u8, &[_]u8{0xff, 0xff, 0xff, 0x7f}, buf[0..writeVarint(&buf, 268435455)]);
+}
+
+test "codec: writeString" {
+	var buf: [400]u8 = undefined;
+	try t.expectError(error.WriteBufferIsFull, writeString(buf[0..0], ""));
+	try t.expectError(error.WriteBufferIsFull, writeString(buf[0..1], ""));
+
+	{
+		const n = try writeString(buf[0..2], "");
+		try t.expectEqualSlices(u8, &.{0, 0}, buf[0..n]);
+	}
+
+	{
+		const n = try writeString(&buf, "over 9000!");
+		try t.expectEqualSlices(u8, &.{0, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!'}, buf[0..n]);
+	}
+
+	{
+		const n = try writeString(&buf, "a" ** 300);
+		try t.expectEqualSlices(u8, [_]u8{1, 44} ++ "a" ** 300, buf[0..n]);
+	}
 }
 
 test "codec: readVarint" {
@@ -133,7 +167,7 @@ test "codec: readVarint" {
 	try t.expectError(error.InvalidVarint, readVarint(&[_]u8{128, 128, 128, 128}));
 }
 
-test "codec: lengthOfVarint"  {
+test "codec: lengthOfVarint" {
 	try t.expectEqual(1, lengthOfVarint(0));
 	try t.expectEqual(1, lengthOfVarint(127));
 	try t.expectEqual(2, lengthOfVarint(128));
@@ -144,23 +178,26 @@ test "codec: lengthOfVarint"  {
 	try t.expectEqual(4, lengthOfVarint(268435455));
 }
 
-test "codec: writeString" {
-	var buf: [400]u8 = undefined;
-	try t.expectError(error.WriteBufferIsFull, writeString(buf[0..0], ""));
-	try t.expectError(error.WriteBufferIsFull, writeString(buf[0..1], ""));
+test "codec: readString" {
+	try t.expectError(error.InvalidString, readString(&.{}));
+	try t.expectError(error.InvalidString, readString(&.{0}));
+	try t.expectError(error.InvalidString, readString(&.{0, 1}));
 
 	{
-		const n = try writeString(buf[0..2], "");
-		try t.expectEqualSlices(u8, &.{0, 0}, buf[0..n]);
+		const str, const len = try readString(&.{0, 0});
+		try t.expectEqual(2, len);
+		try t.expectEqualSlices(u8, "", str);
 	}
 
 	{
-		const n = try writeString(&buf, "over 9000!");
-		try t.expectEqualSlices(u8, &.{0, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!'}, buf[0..n]);
+		const str, const len = try readString(&.{0, 1, 'a'});
+		try t.expectEqual(3, len);
+		try t.expectEqualSlices(u8, "a", str);
 	}
 
 	{
-		const n = try writeString(&buf, "a" ** 300);
-		try t.expectEqualSlices(u8, [_]u8{1, 44} ++ "a" ** 300, buf[0..n]);
+		const str, const len = try readString(&.{0, 2, 'a', 'z', 1, 2, 3});
+		try t.expectEqual(4, len);
+		try t.expectEqualSlices(u8, "az", str);
 	}
 }
