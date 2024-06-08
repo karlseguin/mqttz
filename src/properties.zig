@@ -107,6 +107,9 @@ pub const PUBLISH = [_]PropertyType{
 pub const PUBACK = [_]PropertyType{
 	.reason_string
 };
+pub const PUBREC = PUBACK;
+pub const PUBREL = PUBACK;
+pub const PUBCOMP = PUBACK;
 
 pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyType) error{WriteBufferIsFull}!usize {
 	const properties_len = writeLen(value, properties);

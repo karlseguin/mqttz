@@ -86,9 +86,17 @@ pub const PubAckReason = enum(u8) {
 	implementation_specific_error = 131,
 	not_authorized = 135,
 	topic_name_invalid = 144,
+	packet_identifier_in_use = 145,
 	quota_exceeded = 151,
 	payload_format_invalid = 153,
 };
+pub const PubRecReason = PubAckReason;
+
+pub const PubRelReason = enum(u8) {
+	success = 0,
+	packet_identifier_not_found = 146,
+};
+pub const PubCompReason = PubRelReason;
 
 pub const ConnectOpts = struct {
 	client_id: ?[]const u8 = null,
@@ -153,6 +161,24 @@ pub const PublishOpts = struct {
 pub const PubAckOpts = struct {
 	packet_identifier: u16,
 	reason_code: PubAckReason = .success,
+	reason_string: ?[]const u8 = null,
+};
+
+pub const PubRecOpts = struct {
+	packet_identifier: u16,
+	reason_code: PubRecReason = .success,
+	reason_string: ?[]const u8 = null,
+};
+
+pub const PubRelOpts = struct {
+	packet_identifier: u16,
+	reason_code: PubRelReason = .success,
+	reason_string: ?[]const u8 = null,
+};
+
+pub const PubCompOpts = struct {
+	packet_identifier: u16,
+	reason_code: PubCompReason = .success,
 	reason_string: ?[]const u8 = null,
 };
 
@@ -283,6 +309,30 @@ pub fn Mqtt(comptime S: type) type {
 				return error.Encoding;
 			};
 			try self.writePacket(state, puback_packet);
+		}
+
+		pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) error{Encoding, Write}!void {
+			const pubrec_packet = encodePubRec(self.write_buf, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, pubrec_packet);
+		}
+
+		pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) error{Encoding, Write}!void {
+			const pubrel_packet = encodePubRel(self.write_buf, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, pubrel_packet);
+		}
+
+		pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) error{Encoding, Write}!void {
+			const pubcomp_packet = encodePubComp(self.write_buf, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, pubcomp_packet);
 		}
 
 		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{Encoding, Write}!void {
@@ -656,6 +706,66 @@ fn encodePubAck(buf: []u8, opts: PubAckOpts) ![]u8 {
 	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 4, 0);
 }
 
+fn encodePubRec(buf: []u8, opts: PubRecOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREC);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 80; // packet type (0101) + flags (0000)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 5, 0);
+}
+
+fn encodePubRel(buf: []u8, opts: PubRelOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREL);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 98; // packet type (0101) + flags (0010)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 6, 2);
+}
+
+fn encodePubComp(buf: []u8, opts: PubCompOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBCOMP);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 112; // packet type (0111) + flags (0000)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 7, 0);
+}
+
 fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
 	const remaining_len = buf.len - 5;
 	const length_of_len = codec.lengthOfVarint(remaining_len);
@@ -678,6 +788,9 @@ pub const Packet = union(enum) {
 	suback: SubAck,
 	publish: Publish,
 	puback: PubAck,
+	pubrec: PubRec,
+	pubrel: PubRel,
+	pubcomp: PubComp,
 
 	pub const ConnAck = struct {
 		session_present: bool,
@@ -775,6 +888,24 @@ pub const Packet = union(enum) {
 		reason_code: PubAckReason,
 		reason_string: ?[]const u8 = null,
 	};
+
+	pub const PubRec = struct {
+		packet_identifier: u16,
+		reason_code: PubRecReason,
+		reason_string: ?[]const u8 = null,
+	};
+
+	pub const PubRel = struct {
+		packet_identifier: u16,
+		reason_code: PubRelReason,
+		reason_string: ?[]const u8 = null,
+	};
+
+	pub const PubComp = struct {
+		packet_identifier: u16,
+		reason_code: PubCompReason,
+		reason_string: ?[]const u8 = null,
+	};
 };
 
 fn decodePacket(b1: u8, data: []u8) !Packet {
@@ -785,6 +916,9 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 		2 => return .{.connack = try decodeConnAck(data, flags)},
 		3 => return .{.publish = try decodePublish(data, flags)},
 		4 => return .{.puback = try decodePubAck(data, flags)},
+		5 => return .{.pubrec = try decodePubRec(data, flags)},
+		6 => return .{.pubrel = try decodePubRel(data, flags)},
+		7 => return .{.pubcomp = try decodePubComp(data, flags)},
 		9 => return .{.suback = try decodeSubAck(data, flags)},
 		else => return error.UnknownPacketType, // TODO
 	}
@@ -961,6 +1095,141 @@ fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
 		}
 	}
 	return puback;
+}
+
+fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
+	if (flags != 0) {
+		return error.InvalidFlags;
+	}
+
+	if (data.len < 2) {
+		return error.IncompletePacket;
+	}
+
+	const packet_identifier = codec.readInt(u16, data[0..2]);
+	if (data.len == 2) {
+		// special pubrec with just a packet_identifier
+		// reason_code is implicitly success
+		// no properties
+		return .{
+			.reason_code = .success,
+			.packet_identifier = packet_identifier,
+		};
+	}
+
+	const reason_code: PubRecReason = switch (data[2]) {
+		0 => .success,
+		16 => .no_matching_subscribers,
+		128 => .unspecified_error,
+		131 => .implementation_specific_error,
+		135 => .not_authorized,
+		144 => .topic_name_invalid,
+		151 => .quota_exceeded,
+		153 => .payload_format_invalid,
+		else => return error.MalformedPacket,
+	};
+
+	var pubrec = Packet.PubRec{
+		.packet_identifier = packet_identifier,
+		.reason_code = reason_code,
+	};
+
+	var props = try PropertyReader.init(data[3..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.reason_string => |v| pubrec.reason_string = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+	return pubrec;
+}
+
+fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
+	if (flags != 2) {
+		// what's up with this? Why does this flag have to be 2??
+		return error.InvalidFlags;
+	}
+
+	if (data.len < 2) {
+		return error.IncompletePacket;
+	}
+
+	const packet_identifier = codec.readInt(u16, data[0..2]);
+	if (data.len == 2) {
+		// special pubrel with just a packet_identifier
+		// reason_code is implicitly success
+		// no properties
+		return .{
+			.reason_code = .success,
+			.packet_identifier = packet_identifier,
+		};
+	}
+
+	const reason_code: PubRelReason = switch (data[2]) {
+		0 => .success,
+		146 => .packet_identifier_not_found,
+		else => return error.MalformedPacket,
+	};
+
+	var pubrel = Packet.PubRel{
+		.packet_identifier = packet_identifier,
+		.reason_code = reason_code,
+	};
+
+	var props = try PropertyReader.init(data[3..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.reason_string => |v| pubrel.reason_string = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+	return pubrel;
+}
+
+// If you've gotten this far and are thinking: does he plan on DRYing this stuff?
+// The answer is [obviously]..apparently not.
+fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
+	if (flags != 0) {
+		return error.InvalidFlags;
+	}
+
+	if (data.len < 2) {
+		return error.IncompletePacket;
+	}
+
+	const packet_identifier = codec.readInt(u16, data[0..2]);
+	if (data.len == 2) {
+		// special pubrel with just a packet_identifier
+		// reason_code is implicitly success
+		// no properties
+		return .{
+			.reason_code = .success,
+			.packet_identifier = packet_identifier,
+		};
+	}
+
+	const reason_code: PubCompReason = switch (data[2]) {
+		0 => .success,
+		146 => .packet_identifier_not_found,
+		else => return error.MalformedPacket,
+	};
+
+	var pubcomp = Packet.PubComp{
+		.packet_identifier = packet_identifier,
+		.reason_code = reason_code,
+	};
+
+	var props = try PropertyReader.init(data[3..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.reason_string => |v| pubcomp.reason_string = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+	return pubcomp;
 }
 
 const t = @import("std").testing;
@@ -1191,6 +1460,151 @@ test "Client: puback" {
 		});
 	}
 }
+
+test "Client: pubrec" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// pubrec special short (success with no properties)
+		ctx.reset();
+		try client.pubrec(&ctx, .{.packet_identifier = 5});
+
+		try ctx.expectWritten(1, &.{
+			80,                       // packet type (0101 0000)  (5 for the packet type, 0 for flags)
+			2,                        // payload length
+			0, 5                      // packet identifier
+		});
+	}
+
+	{
+		// pubrec with non-success reason code
+		ctx.reset();
+		try client.pubrec(&ctx, .{.packet_identifier = 1, .reason_code = .quota_exceeded});
+
+		try ctx.expectWritten(1, &.{
+			80,                       // packet type (0101 0000)  (5 for the packet type, 0 for flags)
+			4,                        // payload length
+			0, 1,                     // packet identifier
+			151,                      // reason code
+			0,                        // properties length
+		});
+	}
+
+	{
+		// pubrec with properties
+		ctx.reset();
+		try client.pubrec(&ctx, .{.packet_identifier = 1, .reason_string = "ok"});
+
+		try ctx.expectWritten(1, &.{
+			80,                       // packet type (0101 0000)  (5 for the packet type, 0 for flags)
+			9,                        // payload length
+			0, 1,                     // packet identifier
+			0,                        // reason code
+			5,                        // properties length
+			31, 0, 2, 'o', 'k'
+		});
+	}
+}
+
+test "Client: pubrel" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// pubrel special short (success with no properties)
+		ctx.reset();
+		try client.pubrel(&ctx, .{.packet_identifier = 5});
+
+		try ctx.expectWritten(1, &.{
+			98,                       // packet type (0100 0020)  (6 for the packet type, 2 for flags)
+			2,                        // payload length
+			0, 5                      // packet identifier
+		});
+	}
+
+	{
+		// pubrel with non-success reason code
+		ctx.reset();
+		try client.pubrel(&ctx, .{.packet_identifier = 1, .reason_code = .packet_identifier_not_found});
+
+		try ctx.expectWritten(1, &.{
+			98,                       // packet type (0100 0020)  (6 for the packet type, 2 for flags)
+			4,                        // payload length
+			0, 1,                     // packet identifier
+			146,                      // reason code
+			0,                        // properties length
+		});
+	}
+
+	{
+		// pubrel with properties
+		ctx.reset();
+		try client.pubrel(&ctx, .{.packet_identifier = 1, .reason_string = "ok"});
+
+		try ctx.expectWritten(1, &.{
+			98,                       // packet type (0100 0020)  (6 for the packet type, 2 for flags)
+			9,                        // payload length
+			0, 1,                     // packet identifier
+			0,                        // reason code
+			5,                        // properties length
+			31, 0, 2, 'o', 'k'
+		});
+	}
+}
+
+test "Client: pubcomp" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// pubcomp special short (success with no properties)
+		ctx.reset();
+		try client.pubcomp(&ctx, .{.packet_identifier = 5});
+
+		try ctx.expectWritten(1, &.{
+			112,                       // packet type (0100 0020)  (6 for the packet type, 2 for flags)
+			2,                        // payload length
+			0, 5                      // packet identifier
+		});
+	}
+
+	{
+		// pubcomp with non-success reason code
+		ctx.reset();
+		try client.pubcomp(&ctx, .{.packet_identifier = 1, .reason_code = .packet_identifier_not_found});
+
+		try ctx.expectWritten(1, &.{
+			112,                       // packet type (0100 0020)  (6 for the packet type, 2 for flags)
+			4,                        // payload length
+			0, 1,                     // packet identifier
+			146,                      // reason code
+			0,                        // properties length
+		});
+	}
+
+	{
+		// pubcomp with properties
+		ctx.reset();
+		try client.pubcomp(&ctx, .{.packet_identifier = 1, .reason_string = "ok"});
+
+		try ctx.expectWritten(1, &.{
+			112,                       // packet type (0100 0020)  (6 for the packet type, 2 for flags)
+			9,                        // payload length
+			0, 1,                     // packet identifier
+			0,                        // reason code
+			5,                        // properties length
+			31, 0, 2, 'o', 'k'
+		});
+	}
+}
+
 
 test "Client: disconnect" {
 	var ctx = TestContext.init();
@@ -1543,6 +1957,147 @@ test "Client: readPacket puback" {
 		try t.expectEqual(3, puback.packet_identifier);
 		try t.expectEqual(.not_authorized, puback.reason_code);
 		try t.expectEqualSlices(u8, "nope", puback.reason_string.?);
+	}
+}
+
+test "Client: readPacket pubrec" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+
+	{
+		// short packet
+		ctx.reset();
+		ctx.reply(&.{80, 1, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			80,
+			2,
+			10, 2,                    // packet identifier
+		});
+		const pubrec = (try client.readPacket(&ctx)).pubrec;
+		try t.expectEqual(2562, pubrec.packet_identifier);
+		try t.expectEqual(.success, pubrec.reason_code);
+		try t.expectEqual(null, pubrec.reason_string);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			80,
+			11,
+			0, 3,                    // packet identifier
+			135,                     // reason code
+			7,                       // properties length
+			31, 0, 4, 'n', 'o', 'p', 'e'
+		});
+		const pubrec = (try client.readPacket(&ctx)).pubrec;
+		try t.expectEqual(3, pubrec.packet_identifier);
+		try t.expectEqual(.not_authorized, pubrec.reason_code);
+		try t.expectEqualSlices(u8, "nope", pubrec.reason_string.?);
+	}
+}
+
+test "Client: readPacket pubrel" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+
+	{
+		// short packet
+		ctx.reset();
+		ctx.reply(&.{98, 1, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			98,
+			2,
+			10, 2,                    // packet identifier
+		});
+		const pubrel = (try client.readPacket(&ctx)).pubrel;
+		try t.expectEqual(2562, pubrel.packet_identifier);
+		try t.expectEqual(.success, pubrel.reason_code);
+		try t.expectEqual(null, pubrel.reason_string);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			98,
+			11,
+			0, 3,                    // packet identifier
+			146,                     // reason code
+			7,                       // properties length
+			31, 0, 4, 'n', 'o', 'p', 'e'
+		});
+		const pubrel = (try client.readPacket(&ctx)).pubrel;
+		try t.expectEqual(3, pubrel.packet_identifier);
+		try t.expectEqual(.packet_identifier_not_found, pubrel.reason_code);
+		try t.expectEqualSlices(u8, "nope", pubrel.reason_string.?);
+	}
+}
+
+test "Client: readPacket pubcomp" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+
+	{
+		// short packet
+		ctx.reset();
+		ctx.reply(&.{112, 1, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			112,
+			2,
+			10, 2,                    // packet identifier
+		});
+		const pubcomp = (try client.readPacket(&ctx)).pubcomp;
+		try t.expectEqual(2562, pubcomp.packet_identifier);
+		try t.expectEqual(.success, pubcomp.reason_code);
+		try t.expectEqual(null, pubcomp.reason_string);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{
+			112,
+			11,
+			0, 3,                    // packet identifier
+			146,                     // reason code
+			7,                       // properties length
+			31, 0, 4, 'n', 'o', 'p', 'e'
+		});
+		const pubcomp = (try client.readPacket(&ctx)).pubcomp;
+		try t.expectEqual(3, pubcomp.packet_identifier);
+		try t.expectEqual(.packet_identifier_not_found, pubcomp.reason_code);
+		try t.expectEqualSlices(u8, "nope", pubcomp.reason_string.?);
 	}
 }
 
