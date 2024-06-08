@@ -1,7 +1,6 @@
 const codec = @import("codec.zig");
-const properties = @import("properties.zig");
 const packet = @import("packet.zig");
-pub const PosixClient = @import("posix.zig").Client;
+const properties = @import("properties.zig");
 
 const MIN_BUF_SIZE = 256;
 
@@ -105,8 +104,9 @@ pub const ConnectOpts = struct {
 };
 
 pub const DisconnectOpts = struct {
+	reason: DisconnectReason,
 	session_expiry_interval: ?u32 = null,
-	reason: ?[]const u8 = null,
+	reason_string: ?[]const u8 = null,
 };
 
 pub const SubscribeOpts = struct {
@@ -139,95 +139,37 @@ pub const PublishOpts = struct {
 	content_type: ?[]const u8 = null,
 };
 
-// When we call the provided read implementation, we pass a ReadMeta. The goal
-// is to provide additional information to the implementation, in case it needs
-// it. I imagine most implementations won't use this, but the main goal is
-// to allow implementations to tweak their timeout and possibly error handling
-// based on why read (or write) are being called.
-pub const ReadMeta = struct {
-	calls: usize,
-	reason: Reason,
-
-	pub const Reason = enum {
-		connack,
-		suback,
-	};
-};
-
-// See ReadReason.
-pub const WriteMeta = struct {
-	reason: Reason,
-
-	pub const Reason = enum {
-		connect,
-		publish,
-		subscribe,
-		disconnect,
-	};
-};
-
 // This is my attempt at dealing with Zig's lack of error payload. I'm trying to
 // balance returning relatively specific errors while making it easy for users
 // to handle errors (which I think is something users will want to do in some cases).
 // Those two goals aren't aligned - the more specific errors we have, the more
 // cumbersome is it to write error handling. So our public methods will return
-// higher level errors, things like "WriteError" or "ProtocolError" and, when
+// higher level errors, things like "Write" or "MalformedPacket" and, when
 // applicable, set last_error to some more detailed error.
-pub const ErrorGroup = error {
-	// unlikely, probably a WriteBufferIsFull
-	Encoding,
-
-	// We received an response from the server which wasn't what we expected.
-	// We could parse the packet, but there was something wrong with the data
-	// inside. This could be a missing required field, or receive an unexpected
-	// packet type (like getting a suback when we expect a connack, ...)
-	Protocol,
-
-	// We received a response from the server which seems invalid
-	MalformedPacket,
-
-	// We got an error response from the server
-	Response,
-
-	// Impl.read returned an error
-	ReadImpl,
-
-	// Impl.write returned an error
-	WriteImpl,
-
-	// we believe the connection is closed
-	Closed,
-
-	// The packet was too large to fit in our read buffer
-	ReadBufferIsFull,
-
-	// Client is making improper usage of the library (e.g. subscribing without
-	// providing at least 1 topic)
-	Usage,
-};
-
 pub const ErrorDetail = union(enum) {
 	inner: anyerror,
 	details: []const u8,
 	reason: ErrorReasonCode,
 };
 
-pub fn Client(comptime S: type) type {
-	// We need to call various methods on S, like S.read(s, ...), S.write(s, ...)
-	// and so on. If S is a pointer, that won't work, but we can easily get the
-	// underlying type. So in the end, we'll call Impl.read and Impl.write
-	// where Impl is either S, or *S.
+pub fn Mqtt(comptime S: type) type {
+	// Normally, you'd expect Mqtt to be created with a struct, like Mqtt(Client).
+	// Especially since all we do with S is call functions on it (we never store
+	// an S).
+	// But there are reasons why you might want to use a pointer, like Mqtt(*Client)
+	// such as in our test, where you want to S to compose a client:
+	//    const Client = struct {
+	//      mqtt: Mqtt(Client),
+	//    }
+	// But that won't compile (depending on what version of Zig, it'll just crash
+	// the compiler). But Mqtt(*Client) _will_ work.
 	const Impl = switch (@typeInfo(S)) {
-		.Pointer => |ptr| ptr.child,
 		.Struct => S,
-		else => @compileError("S must be a struct or pointer to a struct"),
+		.Pointer => |ptr| ptr.child,
+		else => @compileError("S must be a struct or pointer to struct"),
 	};
 
 	return struct {
-		// arbitrary state, passed to the read and write function provided
-		// in most cases, this would be a socket/fd
-		state: S,
-
 		// buffer used for reading messages from the server. If a single message
 		// is larger than this, methods will return a error.ReadBufferIsFull
 		read_buf: []u8,
@@ -249,11 +191,13 @@ pub fn Client(comptime S: type) type {
 		// Many packets take an identifier, we increment this by one on each call
 		packet_identifier: u16,
 
+		// Default to true, but might be set to false as a property to connack.
+		// If it does get set to false, we'll error on any publish where retain = true
 		server_can_retain: bool,
 
 		const Self = @This();
 
-		pub fn init(state: S, read_buf: []u8, write_buf: []u8) !Self {
+		pub fn init(read_buf: []u8, write_buf: []u8) !Self {
 			if (read_buf.len < MIN_BUF_SIZE) {
 				return error.ReadBufferTooSmall;
 			}
@@ -263,7 +207,6 @@ pub fn Client(comptime S: type) type {
 			}
 
 			return .{
-				.state = state,
 				.read_pos = 0,
 				.read_len = 0,
 				.read_buf = read_buf,
@@ -275,122 +218,104 @@ pub fn Client(comptime S: type) type {
 			};
 		}
 
-		pub fn connect(self: *Self, opts: ConnectOpts) ErrorGroup!packet.ConnAck {
-			const connect_packet = encodeConnect(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
-
-			try self.writePacket(connect_packet, .connect);
-
-			const connack = switch (try self.readPacket(.connack)) {
-				.connack => |p| p,
-				else => {
-					self.last_error = .{.details = "received packet other than the expected connack"};
-					return error.Protocol;
-				},
-			};
-
-			switch (connack.reason_code) {
-				0 => {}, // success
-				1...127 => return self.receivedInvalidReason(), // returns an error
-				128...255 => |n| return self.receivedErrorReason(n),
-			}
-
-			if (connack.session_present) {
-				// TODO: since we force clean_start = true, this should always be false
-				// but if we support clean_start = false, than this would only be an
-				// error if it otps.clean_start == true.
-
-				// MQTT-3.2.2-4
-				self.disconnect(.protocol_error, .{}) catch {};
-				self.last_error = .{.details = "connack indicated the presence of a session despite requesting clean_start"};
-				return error.Protocol;
-			}
-
-			if (connack.retain_available) |ra| {
-				self.server_can_retain = ra;
-			}
-
-			return connack;
-		}
-
-		pub fn subscribe(self: *Self, opts: SubscribeOpts) ErrorGroup!packet.SubAck {
-			if (opts.topics.len == 0) {
-				self.last_error = .{.details = "must have at least 1 topic"};
-				return error.Usage;
-			}
-
-			const packet_identifier = opts.packet_identifier orelse @atomicRmw(u16, &self.packet_identifier, .Add, 1, .monotonic);
-			const subscribe_packet = encodeSubscribe(self.write_buf, packet_identifier, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
-			try self.writePacket(subscribe_packet, .subscribe);
-
-			const suback = switch (try self.readPacket(.suback)) {
-				.suback => |p| p,
-				// TODO: handle publish, which can happen at any time.
-				else => {
-					self.last_error = .{.details = "received packet other than the expected suback"};
-					return error.Protocol;
-				},
-			};
-
-			return suback;
-		}
-
-		pub fn publish(self: *Self, opts: PublishOpts) ErrorGroup!void {
-			if (opts.retain == true and self.server_can_retain == false) {
-				self.last_error = .{.details = "server does not support retained messages"};
-				return error.Usage;
-			}
-			const packet_identifier = opts.packet_identifier orelse @atomicRmw(u16, &self.packet_identifier, .Add, 1, .monotonic);
-			const publish_packet = encodePublish(self.write_buf, packet_identifier, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
-			try self.writePacket(publish_packet, .publish);
-		}
-
-		pub fn disconnect(self: *Self, reason: DisconnectReason, opts: DisconnectOpts) !void {
-			if (self.disconnected == true) {
-				return;
-			}
-
-			const state = self.state;
-			self.disconnected = true;
-			defer Impl.close(state);
-
-			const disconnect_packet = try encodeDisconnect(self.write_buf, reason, opts);
-			return self.writePacket(disconnect_packet, .disconnect);
-		}
-
 		// Intended to be used for debugging
 		pub fn lastReadPacket(self: *Self) []const u8 {
 			return self.read_buf[0..self.read_pos];
 		}
 
-		const ReadError = error {
-			ReadImpl,
-			Closed,
-			MalformedPacket,
-			ReadBufferIsFull,
-		};
+		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) error{Encoding, Write}!void {
+			const connect_packet = encodeConnect(self.write_buf, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, connect_packet);
+		}
 
-		fn readPacket(self: *Self, reason: ReadMeta.Reason) ReadError!packet.Packet {
+		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) error{Usage, Encoding, Write}!usize {
+			if (opts.topics.len == 0) {
+				self.last_error = .{.details = "must have at least 1 topic"};
+				return error.Usage;
+			}
+
+			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+			const subscribe_packet = encodeSubscribe(self.write_buf, packet_identifier, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, subscribe_packet);
+			return packet_identifier;
+		}
+
+		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) error{Usage, Encoding, Write}!usize {
+			if (opts.retain == true and self.server_can_retain == false) {
+				self.last_error = .{.details = "server does not support retained messages"};
+				return error.Usage;
+			}
+			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+			const publish_packet = encodePublish(self.write_buf, packet_identifier, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, publish_packet);
+			return packet_identifier;
+		}
+
+		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{Encoding, Write}!void {
+			if (self.disconnected == true) {
+				return;
+			}
+
+			self.disconnected = true;
+			defer Impl.close(state);
+
+			const disconnect_packet = encodeDisconnect(self.write_buf, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			return self.writePacket(state, disconnect_packet);
+		}
+
+		fn packetIdentifier(self: *Self, explicit: ?u16) u16 {
+			if (explicit) |pi| {
+				return pi;
+			}
+			const pi = self.packet_identifier + 1;
+			self.packet_identifier = pi;
+			return pi;
+		}
+
+		fn writePacket(self: *Self, state: anytype, data: []const u8) error{Write}!void {
+			return Impl.write(state, data) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Write;
+			};
+		}
+
+		const ReadError = error {
+			Read,
+			Closed,
+			ReadBufferIsFull,
+			Server,
+			Protocol,
+			MalformedPacket,
+			Response,
+		};
+		pub fn readPacket(self: *Self, state: anytype) ReadError!packet.Packet {
+			const p = try self.readOrBuffered(state);
+			switch (p) {
+				.connack => |*connack| try self.processConnack(state, connack),
+				else => {}
+			}
+			return p;
+		}
+
+		fn readOrBuffered(self: *Self, state: anytype) !packet.Packet {
 			if (try self.bufferedPacket()) |p| {
 				return p;
 			}
 
 			var buf = self.read_buf;
 			var pos = self.read_len;
-			var meta = ReadMeta{
-				.calls = 1,
-				.reason = reason,
-			};
-
-			const state = self.state;
 
 			if (pos > 0 and pos == self.read_pos) {
 				// optimize, our last readPacket read exactly 1 packet
@@ -401,6 +326,7 @@ pub fn Client(comptime S: type) type {
 				self.read_len = 0;
 			}
 
+			var calls: usize = 1;
 			while (true) {
 				if (pos == buf.len) {
 					const read_pos = self.read_pos;
@@ -423,9 +349,9 @@ pub fn Client(comptime S: type) type {
 					self.read_len = pos;
 				}
 
-				const n = Impl.read(state, buf[pos..], meta) catch |err| {
+				const n = Impl.read(state, buf[pos..], calls) catch |err| {
 					self.last_error = .{.inner = err};
-					return error.ReadImpl;
+					return error.Read;
 				};
 
 				if (n == 0) {
@@ -440,12 +366,12 @@ pub fn Client(comptime S: type) type {
 					return p;
 				}
 
-				meta.calls += 1;
+				calls += 1;
 			}
 		}
 
-		// see if we have a full packet in
-		fn bufferedPacket(self: *Self) ReadError!?packet.Packet {
+		// see if we have a full packet in our read_buf already
+		fn bufferedPacket(self: *Self) !?packet.Packet {
 			const buf = self.read_buf[self.read_pos..self.read_len];
 
 			// always has to be at least 2 bytes
@@ -473,27 +399,45 @@ pub fn Client(comptime S: type) type {
 			self.read_pos += total_len;
 			return packet.parse(buf[0], buf[fixed_header_len..total_len]) catch |err| {
 				self.last_error = .{.inner = err};
-				return error.MalformedPacket;
+				switch (err) {
+					error.UnknownPacketType => return error.Protocol,
+					else => return error.MalformedPacket,
+				}
 			};
 		}
 
-		fn writePacket(self: *Self, data: []const u8, reason: WriteMeta.Reason) error{WriteImpl}!void {
-			return Impl.write(self.state, data, .{.reason = reason}) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.WriteImpl;
-			};
+		fn processConnack(self: *Self, state: anytype, connack: *const packet.ConnAck) !void {
+			switch (connack.reason_code) {
+				0 => {}, // success
+				1...127 => return self.receivedInvalidReason(state),        // returns an error.Protocol
+				128...255 => |n| return self.receivedErrorReason(state, n), // returns an error.Response
+			}
+
+			if (connack.session_present) {
+				// TODO: since we force clean_start = true, this should always be false
+				// but if we support clean_start = false, than this would only be an
+				// error if it otps.clean_start == true.
+
+				// MQTT-3.2.2-4
+				self.disconnect(state, .{.reason = .protocol_error}) catch {};
+				self.last_error = .{.details = "connack indicated the presence of a session despite requesting clean_start"};
+				return error.Protocol;
+			}
+
+			if (connack.retain_available) |ra| {
+				self.server_can_retain = ra;
+			}
 		}
 
-		fn receivedInvalidReason(self: *Self) error{Protocol} {
-			self.disconnect(.protocol_error, .{}) catch {};
+		fn receivedInvalidReason(self: *Self, state: anytype) error{Protocol} {
+			self.disconnect(state, .{.reason = .protocol_error}) catch {};
 			self.last_error = .{.details = "received an invalid reason code"};
 			return error.Protocol;
 		}
 
-		fn receivedErrorReason(self: *Self, code: u8) error{Response} {
-			// unlikely, probably a WriteF
+		fn receivedErrorReason(self: *Self, state: anytype, code: u8) error{Response} {
 			// MQTT-3.2.2-7
-			Impl.close(self.state);
+			Impl.close(state);
 			const reason: ErrorReasonCode = switch (code) {
 				128 => .unspecified_error,
 				129 => .malformed_packet,
@@ -596,10 +540,10 @@ fn encodeConnect(buf: []u8, opts: ConnectOpts) ![]u8 {
 	return finalizePacket(buf[0..pos], 1, 0);
 }
 
-fn encodeDisconnect(buf: []u8, reason: DisconnectReason, opts: DisconnectOpts) ![]u8 {
+fn encodeDisconnect(buf: []u8, opts: DisconnectOpts) ![]u8 {
 	// reserve 1 byte for the packet type
 	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	buf[5] = @intFromEnum(reason);
+	buf[5] = @intFromEnum(opts.reason);
 	const PROPERTIES_OFFSET = 6;
 	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.DISCONNECT);
 
@@ -681,170 +625,220 @@ fn finalizePacket(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
 }
 
 const t = @import("std").testing;
-test "encodeConnect: minimal" {
-	var buf: [30]u8 = undefined;
-	const encoded = try encodeConnect(&buf, .{});
-	try t.expectEqualSlices(u8, &.{
-		16,                        // packet type
-		13,                        // payload length
-		0, 4, 'M', 'Q', 'T', 'T',  // protocol name
-		5,                         // protocol version
-		2,                         // connect flags (0, 0, 0, 0, 0, 0, 1, 0)
-		0, 0,                      // keepalive sec
-		0,                         // properties length
-		0, 0                       // client_id length
-	}, encoded);
+
+test "Client: connect" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+	{
+		// basic connect call
+		try client.connect(&ctx, .{});
+		try ctx.expectWritten(1, &.{
+			16,                        // packet type
+			13,                        // payload length
+			0, 4, 'M', 'Q', 'T', 'T',  // protocol name
+			5,                         // protocol version
+			2,                         // connect flags (0, 0, 0, 0, 0, 0, 1, 0)
+			0, 0,                      // keepalive sec
+			0,                         // properties length
+			0, 0                       // client_id length
+		});
+	}
+
+	{
+		// more advanced connect call
+		ctx.reset();
+		try client.connect(&ctx,  .{
+			.client_id = "the-client",
+			.username = "the-username",
+			.password = "the-passw0rd",
+			.will = .{
+				.topic = "the topic",
+				.message = "the message",
+				.qos = .exactly_once,
+				.retain = true,
+				.delay_interval = 948824,
+				.payload_format = .utf8,
+				.message_expiry_interval = 225768392,
+				.content_type = "test/type",
+				.response_topic = "test-topic",
+				.correlation_data = "over 9000!!",
+			},
+			.keepalive_sec = 300,
+			.session_expiry_interval = 20,
+			.receive_maximum = 300,
+			.maximum_packet_size = 4000,
+		});
+		try ctx.expectWritten(1, &.{
+			16,                        // packet type
+			116,                       // payload length
+			0, 4, 'M', 'Q', 'T', 'T',  // protocol name
+			5,                         // protocol version
+			246,                       // connect flags (1, 1, 1, 1, 0, 1, 1, 0)
+			                           //               the last 0 is reserved, the middle 0 comes from the "2" (1, 0) of the will qos.
+			1, 44,                     // keepalive sec
+
+			13,                             // properties length
+			0x11, 0, 0, 0, 0x14,            // session expiry interval property
+			0x21, 0x01, 0x2c,               // receive maximum property
+			0x27, 0x00, 0x00, 0x0f, 0xa0,   // maximum packet size interval property
+
+			// payload
+			0, 10,                     // client_id length
+			't', 'h', 'e', '-', 'c', 'l', 'i', 'e', 'n', 't',
+
+			// WILL properties
+			51,                           // will length
+			0x18, 0x00, 0x0E, 0x7A, 0x58, // delay interval
+			0x01, 0x01,                   // payload_format
+			0x02, 0x0D, 0x74, 0xF3, 0xC8, // message_expiry_interval
+
+			// text values have a 2 byte length prefix after the identifier
+			0x03, 0x00, 0x09, 't', 'e', 's', 't', '/', 't', 'y', 'p', 'e',
+			0x08, 0x00, 0x0A, 't', 'e', 's', 't', '-', 't', 'o', 'p', 'i', 'c',
+			0x09, 0x00, 0x0B, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!',
+
+
+			0, 12,                      // username length
+			't', 'h', 'e', '-', 'u', 's', 'e', 'r', 'n', 'a', 'm', 'e',
+			0, 12,                      // password length
+			't', 'h', 'e', '-', 'p', 'a', 's', 's', 'w', '0', 'r', 'd'
+		});
+	}
 }
 
-test "encodeConnect: full" {
-	var buf: [512]u8 = undefined;
-	const encoded = try encodeConnect(&buf, .{
-		.client_id = "the-client",
-		.username = "the-username",
-		.password = "the-passw0rd",
-		.will = .{
-			.topic = "the topic",
-			.message = "the message",
+test "Client: subscribe" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// empty topic
+		try t.expectError(error.Usage, client.subscribe(&ctx, .{.topics = &.{}}));
+		try t.expectEqualSlices(u8, "must have at least 1 topic", client.last_error.?.details);
+	}
+
+	{
+		const pi = try client.subscribe(&ctx, .{
+			.packet_identifier = 10,
+			.topics = &.{.{.filter = "topic1"}},  // always need 1 topic
+		});
+
+		try t.expectEqual(10, pi);
+
+		try ctx.expectWritten(1, &.{
+			130,                       // packet type (1000 0010)  (8 for the packet type, and 2 for the flag, the flag is always 2)
+			12,                        // payload length
+			0, 10,                     // packet identifier
+			0,                         // property length
+			0, 6, 't', 'o', 'p', 'i', 'c', '1',
+			36                         // subscription options
+		});
+	}
+}
+
+test "Client: publish" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// can't publish with retain if server doesn't support retain
+		// (the server should treat this as an error, so we might as well catch it in the library)
+		client.server_can_retain = false;
+		try t.expectError(error.Usage, client.publish(&ctx, .{.retain = true, .topic = "", .message = ""}));
+		try t.expectEqualSlices(u8, "server does not support retained messages", client.last_error.?.details);
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// publish
+		ctx.reset();
+		const pi = try client.publish(&ctx, .{
+			.packet_identifier = 20,
+			.topic = "power/goku",
+			.message = "over 9000!!",
+		});
+
+		try t.expectEqual(20, pi);
+
+		try ctx.expectWritten(1, &.{
+			48,                        // packet type (0011 0000)  (3 for the packet type, 0 since no flag is set)
+			28,                        // payload length
+			0, 10, 'p', 'o', 'w', 'e', 'r', '/', 'g', 'o', 'k', 'u',
+			0, 20,                     // packet identifier
+			0,                         // property length
+			0, 11, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!' // payload (the message)
+		});
+	}
+
+	{
+		// full
+		ctx.reset();
+		client.server_can_retain = true;
+		const pi = try client.publish(&ctx, .{
+			.packet_identifier = 30,
+			.topic = "t1",
+			.message = "m2z",
+			.dup = true,
 			.qos = .exactly_once,
 			.retain = true,
-			.delay_interval = 948824,
 			.payload_format = .utf8,
-			.message_expiry_interval = 225768392,
-			.content_type = "test/type",
-			.response_topic = "test-topic",
-			.correlation_data = "over 9000!!",
-		},
-		.keepalive_sec = 300,
-		.session_expiry_interval = 20,
-		.receive_maximum = 300,
-		.maximum_packet_size = 4000,
-	});
+			.message_expiry_interval = 10
+		});
 
-	try t.expectEqualSlices(u8, &.{
-		16,                        // packet type
-		116,                       // payload length
-		0, 4, 'M', 'Q', 'T', 'T',  // protocol name
-		5,                         // protocol version
-		246,                       // connect flags (1, 1, 1, 1, 0, 1, 1, 0)
-		                           //               the last 0 is reserved, the middle 0 comes from the "2" (1, 0) of the will qos.
-		1, 44,                     // keepalive sec
+		try t.expectEqual(30, pi);
 
-		13,                             // properties length
-		0x11, 0, 0, 0, 0x14,            // session expiry interval property
-		0x21, 0x01, 0x2c,               // receive maximum property
-		0x27, 0x00, 0x00, 0x0f, 0xa0,   // maximum packet size interval property
-
-		// payload
-		0, 10,                     // client_id length
-		't', 'h', 'e', '-', 'c', 'l', 'i', 'e', 'n', 't',
-
-		// WILL properties
-		51,                           // will length
-		0x18, 0x00, 0x0E, 0x7A, 0x58, // delay interval
-		0x01, 0x01,                   // payload_format
-		0x02, 0x0D, 0x74, 0xF3, 0xC8, // message_expiry_interval
-
-		// text values have a 2 byte length prefix after the identifier
-		0x03, 0x00, 0x09, 't', 'e', 's', 't', '/', 't', 'y', 'p', 'e',
-		0x08, 0x00, 0x0A, 't', 'e', 's', 't', '-', 't', 'o', 'p', 'i', 'c',
-		0x09, 0x00, 0x0B, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!',
-
-
-		0, 12,                      // username length
-		't', 'h', 'e', '-', 'u', 's', 'e', 'r', 'n', 'a', 'm', 'e',
-		0, 12,                      // password length
-		't', 'h', 'e', '-', 'p', 'a', 's', 's', 'w', '0', 'r', 'd'
-	}, encoded);
+		try ctx.expectWritten(1, &.{
+			61,                        // packet type (0011 1 10 1)  (3 for the packet type, 1 for dup, 2 for qos, 1 for retain)
+			19,                        // payload length
+			0, 2, 't', '1',
+			0, 30,                     // packet identifier
+			7,                         // property length
+			1, 1,                      //payload format
+			2, 0, 0, 0, 10,            // message expiry interval
+			0, 3, 'm', '2', 'z'        // payload (the message)
+		});
+	}
 }
 
-test "encodeDisconnect: minimal" {
-	var buf: [30]u8 = undefined;
-	const encoded = try encodeDisconnect(&buf, .normal, .{});
+test "Client: disconnect" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
 
-	try t.expectEqualSlices(u8, &.{
-		224,                       // packet type
-		2,                         // payload length
-		0,                         // reason
-		0,                         // property length
-	}, encoded);
-}
+	var client = &ctx.client;
+	{
+		// basic
+		try client.disconnect(&ctx, .{.reason = .normal});
+		try ctx.expectWritten(1, &.{
+			224,                       // packet type
+			2,                         // payload length
+			0,                         // reason
+			0,                         // property length
+		});
+	}
 
-	session_expiry_interval: ?u32 = null,
-	reason: ?[]const u8 = null,
+	{
+		// full
+		ctx.reset();
+		try client.disconnect(&ctx, .{
+			.reason = .message_rate_too_high,
+			.session_expiry_interval = 999998,
+			.reason_string = "tea time",
+		});
 
-test "encodeDisconnect: full" {
-	var buf: [30]u8 = undefined;
-	const encoded = try encodeDisconnect(&buf, .message_rate_too_high, .{
-		.session_expiry_interval = 999998,
-		.reason = "tea time",
-	});
-	try t.expectEqualSlices(u8, &.{
-		224,                          // packet type
-		18,                           // payload length
-		150,                          // reason
-		16,                           // property length
-		0x11, 0x00, 0x0f, 0x42, 0x3e, //sessione expiry interval
-		0x1f, 0x00, 0x08, 't', 'e', 'a', ' ', 't', 'i', 'm', 'e'
-	}, encoded);
-}
-
-test "encodeSubscribe: minimal" {
-	var buf: [30]u8 = undefined;
-	// need at least 1 topic
-	const encoded = try encodeSubscribe(&buf, 10, .{.topics = &.{
-		.{.filter = "topic1"},
-	}});
-
-	try t.expectEqualSlices(u8, &.{
-		130,                       // packet type (1000 0010)  (8 for the packet type, and 2 for the flag, the flag is always 2)
-		12,                        // payload length
-		0, 10,                     // packet identifier
-		0,                         // property length
-		0, 6, 't', 'o', 'p', 'i', 'c', '1',
-		36                         // subscription options
-		                           //   by default, do_not_send_retained and no_local are set
-	}, encoded);
-}
-
-test "encodePublish: minimal" {
-	// This packet fits in a [30]u8 ...BUT, because of the way we encode packets
-	// we always reserved 5 leading bytes to deal with the varint lenght, so [33]u8
-	// is the smallest that will work
-
-	var buf: [33]u8 = undefined;
-	const encoded = try encodePublish(&buf, 20, .{.topic = "power/goku", .message = "over 9000!!"});
-	try t.expectEqualSlices(u8, &.{
-		48,                        // packet type (0011 0000)  (3 for the packet type, 0 since no flag is set)
-		28,                        // payload length
-		0, 10, 'p', 'o', 'w', 'e', 'r', '/', 'g', 'o', 'k', 'u',
-		0, 20,                     // packet identifier
-		0,                         // property length
-		0, 11, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!' // payload (the message)
-	}, encoded);
-}
-
-test "encodePublish: full" {
-	var buf: [50]u8 = undefined;
-	// need at least 1 topic
-	const encoded = try encodePublish(&buf, 30, .{
-		.topic = "t1",
-		.message = "m2z",
-		.dup = true,
-		.qos = .exactly_once,
-		.retain = true,
-		.payload_format = .utf8,
-		.message_expiry_interval = 10
-	});
-	try t.expectEqualSlices(u8, &.{
-		61,                        // packet type (0011 1 10 1)  (3 for the packet type, 1 for dup, 2 for qos, 1 for retain)
-		19,                        // payload length
-		0, 2, 't', '1',
-		0, 30,                     // packet identifier
-		7,                         // property length
-		1, 1,                      //payload format
-		2, 0, 0, 0, 10,            // message expiry interval
-		0, 3, 'm', '2', 'z'        // payload (the message)
-	}, encoded);
+		try ctx.expectWritten(1, &.{
+			224,                          // packet type
+			18,                           // payload length
+			150,                          // reason
+			16,                           // property length
+			0x11, 0x00, 0x0f, 0x42, 0x3e, //sessione expiry interval
+			0x1f, 0x00, 0x08, 't', 'e', 'a', ' ', 't', 'i', 'm', 'e'
+		});
+	}
 }
 
 test "Client: readPacket close" {
@@ -856,8 +850,8 @@ test "Client: readPacket close" {
 	// we've setup, it return 0 (0 bytes read), which should mean closed.
 	ctx.reply(&.{32, 10, 0, 0, 7});
 
-	var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-	try t.expectError(error.Closed, client.readPacket(.connack));
+	var client = &ctx.client;
+	try t.expectError(error.Closed, client.readPacket(&ctx));
 }
 
 test "Client: readPacket fuzz" {
@@ -888,30 +882,31 @@ test "Client: readPacket fuzz" {
 			  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 		});
 
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		const connack = (try client.readPacket(.connack)).connack;
+		var client = &ctx.client;
+		const connack = (try client.readPacket(&ctx)).connack;
 		try t.expectEqualSlices(u8, "none", connack.authentication_method.?);
 
-		const suback1 = (try client.readPacket(.suback)).suback;
+		const suback1 = (try client.readPacket(&ctx)).suback;
 		try t.expectEqual(259, suback1.packet_identifier);
 		try t.expectEqualSlices(u8, &.{0, 1}, suback1.results);
 
-		const suback2 = (try client.readPacket(.suback)).suback;
+		const suback2 = (try client.readPacket(&ctx)).suback;
 		try t.expectEqual(2, suback2.packet_identifier);
 		try t.expectEqualSlices(u8, &([_]u8{0} ** 249), suback2.results);
 	}
 }
 
-test "Client: connect" {
+test "Client: readPacket connack" {
 	var ctx = TestContext.init();
 	defer ctx.deinit();
+
+	var client = &ctx.client;
 
 	{
 		// return with error reason code
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 133, 0});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.Response, client.connect(.{}));
+		try t.expectError(error.Response, client.readPacket(&ctx));
 		try t.expectEqual(.client_identifier_not_valid, client.last_error.?.reason);
 		try t.expectEqual(1, ctx.close_count);
 	}
@@ -920,33 +915,30 @@ test "Client: connect" {
 		// return with invalid reason code
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 100, 0});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.Protocol, client.connect(.{}));
+		try t.expectError(error.Protocol, client.readPacket(&ctx));
 		try t.expectEqual("received an invalid reason code", client.last_error.?.details);
 		try t.expectEqual(1, ctx.close_count);
 	}
 
 	{
-		ctx.reset();
 		// session_present = true
 		// (this is currently always invalid, since we force clean_start = true)
+		ctx.reset();
 		ctx.reply(&.{32, 3, 1, 0, 0});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.Protocol, client.connect(.{}));
+		try t.expectError(error.Protocol, client.readPacket(&ctx));
 		try t.expectEqual("connack indicated the presence of a session despite requesting clean_start", client.last_error.?.details);
 		try t.expectEqual(1, ctx.close_count);
 	}
 
 	{
-		ctx.reset();
 		// success, basic reply
 		// session_present = false
 		// reason code = 0
 		// 0 properties
+		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 0, 0});
 
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		const connack = try client.connect(.{});
+		const connack = (try client.readPacket(&ctx)).connack;
 
 		// the default if the server doesn't send up a retain_available property
 		try t.expectEqual(true, client.server_can_retain);
@@ -961,7 +953,7 @@ test "Client: connect" {
 		try t.expectEqual(null, connack.maximum_packet_size);
 		try t.expectEqual(null, connack.assigned_client_identifier);
 		try t.expectEqual(null, connack.topic_alias_maximum);
-		try t.expectEqual(null, connack.reason);
+		try t.expectEqual(null, connack.reason_string);
 		try t.expectEqual(null, connack.wildcard_subscription_available);
 		try t.expectEqual(null, connack.subscription_identifier_available);
 		try t.expectEqual(null, connack.shared_subscription_available);
@@ -973,16 +965,16 @@ test "Client: connect" {
 	}
 
 	{
-		ctx.reset();
 		// success
 		// session_present = false
 		// reason code = 0
 		// retain_available = 0
 		// server_keepalive property
+		ctx.reset();
 		ctx.reply(&.{32, 8, 0, 0, 5, 19, 0, 60, 37, 0});
 
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		const connack = try client.connect(.{});
+		const connack = (try client.readPacket(&ctx)).connack;
+
 		// server told us it won't/can't retain
 		try t.expectEqual(false, client.server_can_retain);
 		try t.expectEqual(0, ctx.close_count);
@@ -996,7 +988,7 @@ test "Client: connect" {
 		try t.expectEqual(null, connack.maximum_packet_size);
 		try t.expectEqual(null, connack.assigned_client_identifier);
 		try t.expectEqual(null, connack.topic_alias_maximum);
-		try t.expectEqual(null, connack.reason);
+		try t.expectEqual(null, connack.reason_string);
 		try t.expectEqual(null, connack.wildcard_subscription_available);
 		try t.expectEqual(null, connack.subscription_identifier_available);
 		try t.expectEqual(null, connack.shared_subscription_available);
@@ -1010,27 +1002,19 @@ test "Client: connect" {
 	}
 }
 
-test "Client: subscribe" {
+test "Client: readPacket suback" {
 	var ctx = TestContext.init();
 	defer ctx.deinit();
 
-	{
-		// return with error reason code
-		ctx.reset();
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.Usage, client.subscribe(.{.topics = &.{}}));
-		try t.expectEqualSlices(u8, "must have at least 1 topic", client.last_error.?.details);
-		try t.expectEqual(0, ctx.close_count);
-	}
+	var client = &ctx.client;
 
 	{
-		// return with invalid packet flags
 		ctx.reset();
+		// return with invalid packet flags
 		// first byte should always be 144. 145 means the LSB is set, which it should not be
 		// (the flag, the last 4 bits, should always be 0
 		ctx.reply(&.{145, 4, 0, 0, 0, 0});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.MalformedPacket, client.subscribe(.{.topics = &.{.{.filter = ""}}}));
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
 		try t.expectEqual(error.InvalidFlags, client.last_error.?.inner);
 		try t.expectEqual(0, ctx.close_count);
 	}
@@ -1038,22 +1022,16 @@ test "Client: subscribe" {
 	{
 		// wrong packet type
 		ctx.reset();
-		// first byte should always be 144. 145 means the LSB is set, which it should not be
-		// (the flag, the last 4 bits, should always be 0
-		ctx.reply(&.{32, 3, 0, 0, 0});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.Protocol, client.subscribe(.{.topics = &.{.{.filter = ""}}}));
+		ctx.reply(&.{7, 3, 0, 0, 0});
+		try t.expectError(error.Protocol, client.readPacket(&ctx));
 		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
 		// short packet
 		ctx.reset();
-		// first byte should always be 144. 145 means the LSB is set, which it should not be
-		// (the flag, the last 4 bits, should always be 0
 		ctx.reply(&.{144, 3, 0, 0, 0});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		try t.expectError(error.MalformedPacket, client.subscribe(.{.topics = &.{.{.filter = ""}}}));
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
 		try t.expectEqual(0, ctx.close_count);
 	}
 
@@ -1061,10 +1039,9 @@ test "Client: subscribe" {
 		// basic response
 		ctx.reset();
 		ctx.reply(&.{144, 4, 1, 2, 0, 1});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		const suback = try client.subscribe(.{.topics = &.{.{.filter = ""}}});
+		const suback = (try client.readPacket(&ctx)).suback;
 		try t.expectEqual(258, suback.packet_identifier);
-		try t.expectEqual(null, suback.reason);
+		try t.expectEqual(null, suback.reason_string);
 		try t.expectEqualSlices(u8, &.{1}, suback.results);
 		try t.expectEqual(.at_least_once, suback.result(0).granted);
 		try t.expectEqual({}, suback.result(2).invalid_index);
@@ -1081,10 +1058,9 @@ test "Client: subscribe" {
 			31, 0, 2, 'o', 'k',  // reason
 			2, 135, 4,   // 3 reasons
 		});
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		const suback = try client.subscribe(.{.topics = &.{.{.filter = "x"}}});
+		const suback = (try client.readPacket(&ctx)).suback;
 		try t.expectEqual(1, suback.packet_identifier);
-		try t.expectEqualSlices(u8, "ok", suback.reason.?);
+		try t.expectEqualSlices(u8, "ok", suback.reason_string.?);
 		try t.expectEqualSlices(u8, &.{2, 135, 4}, suback.results);
 		try t.expectEqual(.exactly_once, suback.result(0).granted);
 		try t.expectEqual(.not_authorized, suback.result(1).err);
@@ -1092,33 +1068,22 @@ test "Client: subscribe" {
 	}
 }
 
-test "Client: publish" {
-	var ctx = TestContext.init();
-	defer ctx.deinit();
+// test "Client: publish" {
+// 	var ctx = TestContext.init();
+// 	defer ctx.deinit();
 
-	{
-		// can't publish with retain if server doesn't support retain
-		// (the server should treat this as an error, so we might as well catch it in the library)
-		ctx.reset();
-		var client = try TestClient.init(&ctx, ctx.read_buf, ctx.write_buf);
-		client.server_can_retain = false;
-		try t.expectError(error.Usage, client.publish(.{.retain = true, .topic = "", .message = ""}));
-		try t.expectEqualSlices(u8, "server does not support retained messages", client.last_error.?.details);
-		try t.expectEqual(0, ctx.close_count);
-	}
-}
 
-const TestClient = Client(*TestContext);
+// }
 
 const TestContext = struct {
 	arena: *std.heap.ArenaAllocator,
-	read_buf: []u8,
-	write_buf: []u8,
 	to_read_pos: usize,
 	to_read: std.ArrayList(u8),
-	written: std.ArrayList([]u8),
+	written: std.ArrayList(u8),
+	write_count: usize,
 	close_count: usize,
 	_random: ?std.rand.DefaultPrng = null,
+	client: Mqtt(*TestContext),
 
 	const std = @import("std");
 
@@ -1128,14 +1093,17 @@ const TestContext = struct {
 
 		const allocator = arena.allocator();
 
+		const read_buf = allocator.alloc(u8, MIN_BUF_SIZE) catch unreachable;
+		const write_buf = allocator.alloc(u8, MIN_BUF_SIZE) catch unreachable;
+
 		return .{
 			.arena = arena,
-			.read_buf = allocator.alloc(u8, MIN_BUF_SIZE) catch unreachable,
-			.write_buf = allocator.alloc(u8, MIN_BUF_SIZE) catch unreachable,
 			.to_read_pos = 0,
 			.to_read = std.ArrayList(u8).init(allocator),
-			.written = std.ArrayList([]u8).init(allocator),
+			.written = std.ArrayList(u8).init(allocator),
+			.write_count = 0,
 			.close_count = 0,
+			.client = Mqtt(*TestContext).init(read_buf, write_buf) catch unreachable,
 		};
 	}
 
@@ -1146,16 +1114,20 @@ const TestContext = struct {
 
 	fn reset(self: *TestContext) void {
 		self.to_read_pos = 0;
+		self.write_count = 0;
 		self.close_count = 0;
 		self.to_read.clearRetainingCapacity();
 		self.written.clearRetainingCapacity();
+
+		self.client.disconnected = false;
+		self.client.server_can_retain = true;
 	}
 
 	fn reply(self: *TestContext, data: []const u8) void {
 		self.to_read.appendSlice(self.arena.allocator().dupe(u8, data) catch unreachable) catch unreachable;
 	}
 
-	fn read(self: *TestContext, buf: []u8, _: ReadMeta) !usize {
+	fn read(self: *TestContext, buf: []u8, _: usize) !usize {
 		const data = self.to_read.items[self.to_read_pos..];
 
 		if (data.len == 0 or buf.len == 0) {
@@ -1169,9 +1141,9 @@ const TestContext = struct {
 		return to_read;
 	}
 
-	fn write(self: *TestContext, data: []const u8, _: WriteMeta) !void {
-		const duped = try self.arena.allocator().dupe(u8, data);
-		try self.written.append(duped);
+	fn write(self: *TestContext, data: []const u8) !void {
+		try self.written.appendSlice(data);
+		self.write_count += 1;
 	}
 
 	fn close(self: *TestContext) void {
@@ -1185,5 +1157,10 @@ const TestContext = struct {
 			self._random = std.rand.DefaultPrng.init(seed);
 		}
 		return self._random.?.random();
+	}
+
+	fn expectWritten(self: *TestContext, count: usize, data: []const u8) !void {
+		try t.expectEqual(count, self.write_count);
+		try t.expectEqualSlices(u8, data, self.written.items);
 	}
 };

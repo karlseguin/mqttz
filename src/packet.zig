@@ -28,7 +28,7 @@ pub const ConnAck = struct {
 	maximum_packet_size: ?u32 = null,
 	assigned_client_identifier: ?[]const u8 = null,
 	topic_alias_maximum: ?u16 = null,
-	reason: ?[]const u8 = null,
+	reason_string: ?[]const u8 = null,
 	wildcard_subscription_available: ?bool = null,
 	subscription_identifier_available: ?bool = null,
 	shared_subscription_available: ?bool = null,
@@ -70,7 +70,7 @@ pub const ConnAck = struct {
 				.maximum_packet_size => |v| connack.maximum_packet_size = v,
 				.assigned_client_identifier => |v| connack.assigned_client_identifier = v,
 				.topic_alias_maximum => |v| connack.topic_alias_maximum = v,
-				.reason => |v| connack.reason = v,
+				.reason_string => |v| connack.reason_string = v,
 				.wildcard_subscription_available => |v| connack.wildcard_subscription_available = v,
 				.subscription_identifier_available => |v| connack.subscription_identifier_available = v,
 				.shared_subscription_available => |v| connack.shared_subscription_available = v,
@@ -90,7 +90,7 @@ pub const ConnAck = struct {
 
 pub const SubAck = struct {
 	packet_identifier: u16,
-	reason: ?[]const u8 = null,
+	reason_string: ?[]const u8 = null,
 	results: []const u8,
 
 	pub fn parse(data: []u8, flags: u8) !SubAck {
@@ -114,7 +114,7 @@ pub const SubAck = struct {
 		var properties = try PropertyReader.init(data[2..]);
 		while (try properties.next()) |prop| {
 			switch (prop) {
-				.reason => |v| suback.reason = v,
+				.reason_string => |v| suback.reason_string = v,
 				.user_property => {}, // TODO: handle
 				else => return error.InvalidProperty,
 			}

@@ -18,7 +18,7 @@ pub const PropertyType = enum(u8) {
 	request_response_information = 25,
 	response_information = 26,
 	server_reference = 28,
-	reason = 31,
+	reason_string = 31,
 	receive_maximum = 33,
 	topic_alias_maximum = 34,
 	topic_alias = 35,
@@ -50,7 +50,7 @@ pub const Property = union(PropertyType) {
 	request_response_information: u8,
 	response_information: []const u8,
 	server_reference: []const u8,
-	reason: []const u8,
+	reason_string: []const u8,
 	receive_maximum: u16,
 	topic_alias_maximum: u16,
 	topic_alias: u16,
@@ -87,7 +87,7 @@ pub const WILL = [_]PropertyType{
 
 pub const DISCONNECT = [_]PropertyType{
 	.session_expiry_interval,
-	.reason,
+	.reason_string,
 };
 
 pub const SUBSCRIBE = [_]PropertyType{
