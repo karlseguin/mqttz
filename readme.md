@@ -4,6 +4,14 @@ This is a [hopefully] embed-friendly MQTT client library for Zig. Currently, the
 
 A higher-level wrapper that uses the standard library is planned.
 
+## Examples
+See example/subscriber.zig and example/publisher.zig for basic examples. While these example use `std` and an allocator (briefly), `mqttz` itself does not rely on `std` and is allocation-free.
+
+Start the subscriber via: `zig build example_subscriber`. 
+Then start the publisher via: `zig build example_publisher`. 
+
+You should see 3 messages printed in your subscriber, then both programs will exit. These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
+
 ## Overview
 The approach of `mqtt.Mqtt(T)` is to have T provide the `read`, `write` and `close` functions. This decouples the `Mqtt(T)` library from the platform implementation.
 
@@ -295,7 +303,6 @@ Possible errors are:
 - `error.ReadBufferIsFull` - The packet was too large to fit in `read_buf`
 - `error.Protocol` - A valid packet was received but, from this libraries point of view, the packet didn't make sense. For example, the packet might have had a `reason_code` which was not valid (not one of the allowed u8 values). If you're using a robust server implementation, this is likely a bug/oversight in this library
 - `error.MalformedPacket` - An invalid packet was received which could not be parsed. If you're using a robust server implementation, this is likely a bug/oversight in this library.
-- `error.Reason` - A valid response was received, but with an error reason. Use `last_error.?.reason` to get the enum reason. In many cases, this will be followed by the server closing the connection.
 
 On success, `readPacket` returns a tagged union. This union has the following tags:
 

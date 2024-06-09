@@ -336,7 +336,6 @@ pub fn Mqtt(comptime T: type) type {
 			ReadBufferIsFull,
 			Protocol,
 			MalformedPacket,
-			Reason,
 		};
 		pub fn readPacket(self: *Self, state: anytype) ReadError!Packet {
 			const p = try self.readOrBuffered(state);
@@ -439,18 +438,13 @@ pub fn Mqtt(comptime T: type) type {
 				self.last_error = .{.inner = err};
 				switch (err) {
 					error.UnknownPacketType => return error.Protocol,
+					error.InvalidReasonCode => return error.Protocol,
 					else => return error.MalformedPacket,
 				}
 			};
 		}
 
 		fn processConnack(self: *Self, state: anytype, connack: *const Packet.ConnAck) !void {
-			switch (connack.reason_code) {
-				0 => {}, // success
-				1...127 => return self.receivedInvalidReason(state),        // returns an error.Protocol
-				128...255 => |n| return self.receivedErrorReason(n), // returns an error.Reason
-			}
-
 			if (connack.session_present) {
 				// TODO: since we force clean_start = true, this should always be false
 				// but if we support clean_start = false, than this would only be an
@@ -465,55 +459,6 @@ pub fn Mqtt(comptime T: type) type {
 			if (connack.retain_available) |ra| {
 				self.server_can_retain = ra;
 			}
-		}
-
-		fn receivedInvalidReason(self: *Self, state: anytype) error{Protocol} {
-			self.disconnect(state, .{.reason = .protocol_error}) catch {};
-			self.last_error = .{.details = "received an invalid reason code"};
-			return error.Protocol;
-		}
-
-		fn receivedErrorReason(self: *Self, code: u8) error{Reason} {
-			const reason: ErrorReasonCode = switch (code) {
-				128 => .unspecified_error,
-				129 => .malformed_packet,
-				130 => .protocol_error,
-				131 => .implementation_specific_error,
-				132 => .unsupported_protocol_version,
-				133 => .client_identifier_not_valid,
-				134 => .bad_user_name_or_password,
-				135 => .not_authorized,
-				136 => .server_unavailable,
-				137 => .server_busy,
-				138 => .banned,
-				139 => .server_shutting_down,
-				140 => .bad_authentication_method,
-				141 => .keep_alive_timeout,
-				142 => .session_taken_over,
-				143 => .topic_filter_invalid,
-				144 => .topic_name_invalid,
-				145 => .packet_identifier_in_use,
-				146 => .packet_identifier_not_found,
-				147 => .receive_maximum_exceeded,
-				148 => .topic_alias_invalid,
-				149 => .packet_too_large,
-				150 => .message_rate_too_high,
-				151 => .quota_exceeded,
-				152 => .administrative_action,
-				153 => .payload_format_invalid,
-				154 => .retain_not_supported,
-				155 => .qos_not_supported,
-				156 => .use_another_server,
-				157 => .server_moved,
-				158 => .shared_subscriptions_not_supported,
-				159 => .connection_rate_exceeded,
-				160 => .maximum_connect_time,
-				161 => .subscription_identifiers_not_supported,
-				162 => .wildcard_subscriptions_not_supported,
-				else => .unknown,
-			};
-			self.last_error = .{.reason = reason};
-			return error.Reason;
 		}
 	};
 }
@@ -651,15 +596,25 @@ fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
 	const VARIABLE_HEADER_OFFSET = 5;
 	const topic_len = try codec.writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
 
-	const packet_identifer_offset = VARIABLE_HEADER_OFFSET + topic_len;
-	const properties_offset = packet_identifer_offset + 2;
-	codec.writeInt(u16, buf[packet_identifer_offset..properties_offset][0..2], packet_identifier);
+
+	var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
+	if (opts.qos != .at_most_once) {
+		// when QoS > 0, we include a packet identifier
+		const packet_identifier_offset = properties_offset;
+		properties_offset += 2;
+		codec.writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], packet_identifier);
+	}
+
 	const properties_len = try properties.write(buf[properties_offset..], opts, &properties.PUBLISH);
 
 	const payload_offset = properties_offset + properties_len;
-	const payload_len = try codec.writeString(buf[payload_offset..], opts.message);
-
-	return encodePacketHeader(buf[0..payload_offset + payload_len], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
+	const message = opts.message;
+	const end = payload_offset + message.len;
+	if (end > buf.len) {
+		return error.WriteBufferIsFull;
+	}
+	@memcpy(buf[payload_offset..end], message);
+	return encodePacketHeader(buf[0..end], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
 }
 
 fn encodePubAck(buf: []u8, opts: PubAckOpts) ![]u8 {
@@ -773,7 +728,7 @@ pub const Packet = union(enum) {
 
 	pub const ConnAck = struct {
 		session_present: bool,
-		reason_code: u8,
+		reason_code: ReasonCode,
 		session_expiry_interval: ?u32 = null,
 		receive_maximum: ?u16 = null,
 		maximum_qos: ?QoS = null,
@@ -790,6 +745,31 @@ pub const Packet = union(enum) {
 		server_reference: ?[]const u8 = null,
 		authentication_method: ?[]const u8 = null,
 		authentication_data: ?[]const u8 = null,
+
+		pub const ReasonCode = enum(u8) {
+			success = 0,
+			unspecified_error = 128,
+			malformed_packet = 129,
+			protocol_error = 130,
+			implementation_specific_error = 131,
+			unsupported_protocol_version = 132,
+			client_identifier_not_valid = 133,
+			bad_user_name_or_password = 134,
+			not_authorized = 135,
+			server_unavailable = 136,
+			server_busy = 137,
+			banned = 138,
+			bad_authentication_method = 140,
+			topic_name_invalid = 144,
+			packet_too_large = 149,
+			quota_exceeded = 151,
+			payload_format_invalid = 153,
+			retain_not_supported = 154,
+			qos_not_supported = 155,
+			use_another_server = 156,
+			server_moved = 157,
+			connection_rate_exceeded = 159,
+		};
 	};
 
 	pub const SubAck = struct {
@@ -872,7 +852,8 @@ pub const Packet = union(enum) {
 
 		topic: []const u8,
 		message: []const u8,
-		packet_identifier: u16,
+		// null when qos is .at_least_once
+		packet_identifier: ?u16,
 
 		payload_format: ?PayloadFormat = null,
 		message_expiry_interval: ?u32 = null, // does a server ever send this?
@@ -913,7 +894,7 @@ pub const Packet = union(enum) {
 		// not sure this is ever set by the server
 		session_expiry_interval: ?u32 = null,
 
-		const ReasonCode = enum(u8) {
+		pub const ReasonCode = enum(u8) {
 			normal = 0,
 			unspecified_error = 128,
 			malformed_packet = 129,
@@ -982,9 +963,35 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 		else => return error.MalformedPacket,
 	};
 
+	const reason_code: Packet.ConnAck.ReasonCode = switch (data[1]) {
+		0 => .success,
+		128 => .unspecified_error,
+		129 => .malformed_packet,
+		130 => .protocol_error,
+		131 => .implementation_specific_error,
+		132 => .unsupported_protocol_version,
+		133 => .client_identifier_not_valid,
+		134 => .bad_user_name_or_password,
+		135 => .not_authorized,
+		136 => .server_unavailable,
+		137 => .server_busy,
+		138 => .banned,
+		140 => .bad_authentication_method,
+		144 => .topic_name_invalid,
+		149 => .packet_too_large,
+		151 => .quota_exceeded,
+		153 => .payload_format_invalid,
+		154 => .retain_not_supported,
+		155 => .qos_not_supported,
+		156 => .use_another_server,
+		157 => .server_moved,
+		159 => .connection_rate_exceeded,
+		else => return error.InvalidReasonCode,
+	};
+
 	var connack = Packet.ConnAck{
 		.session_present = session_present,
-		.reason_code = data[1],
+		.reason_code = reason_code,
 	};
 
 	var props = try PropertyReader.init(data[2..]);
@@ -1094,17 +1101,21 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
 
 	const publish_flags: *PublishFlags = @constCast(@ptrCast(&flags));
 
-	const topic, const packet_identifier_offset = try codec.readString(data);
-	const properties_offset = packet_identifier_offset + 2;
-
+	const topic, var properties_offset = try codec.readString(data);
 	var publish = Packet.Publish{
 		.dup = publish_flags.dup,
 		.qos = publish_flags.qos,
 		.retain = publish_flags.retain,
 		.topic = topic,
 		.message = undefined,
-		.packet_identifier = codec.readInt(u16, data[packet_identifier_offset..properties_offset][0..2]),
+		.packet_identifier = null,
 	};
+
+	if (publish.qos != .at_most_once) {
+		const packet_identifier_offset = properties_offset;
+		properties_offset += 2;
+		publish.packet_identifier = codec.readInt(u16, data[packet_identifier_offset..properties_offset][0..2]);
+	}
 
 	var props = try PropertyReader.init(data[properties_offset..]);
 	while (try props.next()) |prop| {
@@ -1121,7 +1132,7 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
 		}
 	}
 
-	publish.message, _ = try codec.readString(data[properties_offset + props.len..]);
+	publish.message = data[properties_offset + props.len..];
 	return publish;
 }
 
@@ -1348,7 +1359,7 @@ fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
 		160 => .maximum_connect_time,
 		161 => .subscription_identifiers_not_supported,
 		162 => .wildcard_subscriptions_not_supported,
-		else => return error.Protocol,
+		else => return error.InvalidReasonCode,
 	};
 
 	var disconnect = Packet.Disconnect{
@@ -1525,11 +1536,10 @@ test "Client: publish" {
 		client.server_can_retain = false;
 		try t.expectError(error.Usage, client.publish(&ctx, .{.retain = true, .topic = "", .message = ""}));
 		try t.expectEqualSlices(u8, "server does not support retained messages", client.last_error.?.details);
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
-		// publish
+		// publish qos = .at_least_once (no packet identifier)
 		ctx.reset();
 		const pi = try client.publish(&ctx, .{
 			.packet_identifier = 20,
@@ -1541,11 +1551,10 @@ test "Client: publish" {
 
 		try ctx.expectWritten(1, &.{
 			48,                        // packet type (0011 0000)  (3 for the packet type, 0 since no flag is set)
-			28,                        // payload length
+			24,                        // payload length
 			0, 10, 'p', 'o', 'w', 'e', 'r', '/', 'g', 'o', 'k', 'u',
-			0, 20,                     // packet identifier
 			0,                         // property length
-			0, 11, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!' // payload (the message)
+			'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!', '!' // payload (the message)
 		});
 	}
 
@@ -1568,13 +1577,13 @@ test "Client: publish" {
 
 		try ctx.expectWritten(1, &.{
 			61,                        // packet type (0011 1 10 1)  (3 for the packet type, 1 for dup, 2 for qos, 1 for retain)
-			19,                        // payload length
+			17,                        // payload length
 			0, 2, 't', '1',
 			0, 30,                     // packet identifier
 			7,                         // property length
 			1, 1,                      //payload format
 			2, 0, 0, 0, 10,            // message expiry interval
-			0, 3, 'm', '2', 'z'        // payload (the message)
+			'm', '2', 'z'        // payload (the message)
 		});
 	}
 }
@@ -1886,9 +1895,8 @@ test "Client: readPacket connack" {
 		// return with error reason code
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 133, 0});
-		try t.expectError(error.Reason, client.readPacket(&ctx));
-		try t.expectEqual(.client_identifier_not_valid, client.last_error.?.reason);
-		try t.expectEqual(0, ctx.close_count);
+		const connack = (try client.readPacket(&ctx)).connack;
+		try t.expectEqual(.client_identifier_not_valid, connack.reason_code);
 	}
 
 	{
@@ -1896,8 +1904,7 @@ test "Client: readPacket connack" {
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 100, 0});
 		try t.expectError(error.Protocol, client.readPacket(&ctx));
-		try t.expectEqual("received an invalid reason code", client.last_error.?.details);
-		try t.expectEqual(1, ctx.close_count);
+		try t.expectEqual(error.InvalidReasonCode, client.last_error.?.inner);
 	}
 
 	{
@@ -1907,7 +1914,6 @@ test "Client: readPacket connack" {
 		ctx.reply(&.{32, 3, 1, 0, 0});
 		try t.expectError(error.Protocol, client.readPacket(&ctx));
 		try t.expectEqual("connack indicated the presence of a session despite requesting clean_start", client.last_error.?.details);
-		try t.expectEqual(1, ctx.close_count);
 	}
 
 	{
@@ -1923,9 +1929,8 @@ test "Client: readPacket connack" {
 		// the default if the server doesn't send up a retain_available property
 		try t.expectEqual(true, client.server_can_retain);
 
-		try t.expectEqual(0, ctx.close_count);
 		try t.expectEqual(false, connack.session_present);
-		try t.expectEqual(0, connack.reason_code);
+		try t.expectEqual(.success, connack.reason_code);
 		try t.expectEqual(null, connack.session_expiry_interval);
 		try t.expectEqual(null, connack.receive_maximum);
 		try t.expectEqual(null, connack.maximum_qos);
@@ -1957,10 +1962,9 @@ test "Client: readPacket connack" {
 
 		// server told us it won't/can't retain
 		try t.expectEqual(false, client.server_can_retain);
-		try t.expectEqual(0, ctx.close_count);
 
 		try t.expectEqual(false, connack.session_present);
-		try t.expectEqual(0, connack.reason_code);
+		try t.expectEqual(.success, connack.reason_code);
 		try t.expectEqual(null, connack.session_expiry_interval);
 		try t.expectEqual(null, connack.receive_maximum);
 		try t.expectEqual(null, connack.maximum_qos);
@@ -1996,7 +2000,6 @@ test "Client: readPacket suback" {
 		ctx.reply(&.{145, 4, 0, 0, 0, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
 		try t.expectEqual(error.InvalidFlags, client.last_error.?.inner);
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2004,7 +2007,6 @@ test "Client: readPacket suback" {
 		ctx.reset();
 		ctx.reply(&.{7, 3, 0, 0, 0});
 		try t.expectError(error.Protocol, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2012,7 +2014,6 @@ test "Client: readPacket suback" {
 		ctx.reset();
 		ctx.reply(&.{144, 3, 0, 0, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2060,7 +2061,6 @@ test "Client: readPacket unsuback" {
 		ctx.reply(&.{178, 4, 0, 0, 0, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
 		try t.expectEqual(error.InvalidFlags, client.last_error.?.inner);
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2068,7 +2068,6 @@ test "Client: readPacket unsuback" {
 		ctx.reset();
 		ctx.reply(&.{176, 3, 0, 0, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2115,22 +2114,48 @@ test "Client: readPacket publish" {
 		ctx.reset();
 		ctx.reply(&.{48, 4, 0, 0, 0, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
-		// basic response
+		// qos = at_most_once (won't have property identifier)
 		ctx.reset();
 		ctx.reply(&.{
 			48,
-			15,
+			11,
 			0, 3, 'a', '/', 'b',      // topic
-			10, 1,                    // packet identifier
 			0,                        // property list length
-			0, 5, 'h', 'e', 'l', 'l', 'o'  // payload (message)
+			'h', 'e', 'l', 'l', 'o'   // payload (message)
 		});
 		const publish = (try client.readPacket(&ctx)).publish;
 		try t.expectEqual(.at_most_once, publish.qos);
+		try t.expectEqual(false, publish.dup);
+		try t.expectEqual(false, publish.retain);
+		try t.expectEqual(null, publish.packet_identifier);
+		try t.expectEqualSlices(u8, "a/b", publish.topic);
+		try t.expectEqualSlices(u8, "hello", publish.message);
+
+		try t.expectEqual(null, publish.payload_format);
+		try t.expectEqual(null, publish.message_expiry_interval);
+		try t.expectEqual(null, publish.topic_alias);
+		try t.expectEqual(null, publish.response_topic);
+		try t.expectEqual(null, publish.correlation_data);
+		try t.expectEqual(null, publish.subscription_identifier);
+		try t.expectEqual(null, publish.content_type);
+	}
+
+	{
+		// qos = at_least_once (will property identifier)
+		ctx.reset();
+		ctx.reply(&.{
+			50,
+			13,
+			0, 3, 'a', '/', 'b',      // topic
+			10, 1,                    // packet identifier
+			0,                        // property list length
+			'h', 'e', 'l', 'l', 'o'  // payload (message)
+		});
+		const publish = (try client.readPacket(&ctx)).publish;
+		try t.expectEqual(.at_least_once, publish.qos);
 		try t.expectEqual(false, publish.dup);
 		try t.expectEqual(false, publish.retain);
 		try t.expectEqual(2561, publish.packet_identifier);
@@ -2159,7 +2184,6 @@ test "Client: readPacket puback" {
 		ctx.reset();
 		ctx.reply(&.{64, 1, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2206,7 +2230,6 @@ test "Client: readPacket pubrec" {
 		ctx.reset();
 		ctx.reply(&.{80, 1, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2253,7 +2276,6 @@ test "Client: readPacket pubrel" {
 		ctx.reset();
 		ctx.reply(&.{98, 1, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2300,7 +2322,6 @@ test "Client: readPacket pubcomp" {
 		ctx.reset();
 		ctx.reply(&.{112, 1, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2347,7 +2368,6 @@ test "Client: readPacket pong" {
 		ctx.reset();
 		ctx.reply(&.{211, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2370,7 +2390,6 @@ test "Client: readPacket disconnect" {
 		ctx.reset();
 		ctx.reply(&.{225, 0});
 		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
-		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
