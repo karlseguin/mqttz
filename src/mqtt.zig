@@ -356,6 +356,12 @@ pub fn Mqtt(comptime S: type) type {
 			try self.writePacket(state, pubcomp_packet);
 		}
 
+		pub fn ping(self: *Self, state: anytype) error{Write}!void {
+			// 1100 000  (packet type + flags)
+			// 0         (varing payload length)
+			try self.writePacket(state, &.{192, 0});
+		}
+
 		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{Encoding, Write}!void {
 			if (self.disconnected == true) {
 				return;
@@ -828,6 +834,7 @@ pub const Packet = union(enum) {
 	pubrec: PubRec,
 	pubrel: PubRel,
 	pubcomp: PubComp,
+	pong: void,
 
 	pub const ConnAck = struct {
 		session_present: bool,
@@ -979,6 +986,7 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 		7 => return .{.pubcomp = try decodePubComp(data, flags)},
 		9 => return .{.suback = try decodeSubAck(data, flags)},
 		11 => return .{.unsuback = try decodeUnsubAck(data, flags)},
+		13 => return if (flags == 0) .{.pong = {}} else error.InvalidFlags,
 		else => return error.UnknownPacketType, // TODO
 	}
 }
@@ -1765,6 +1773,20 @@ test "Client: disconnect" {
 	}
 }
 
+test "Client: ping" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+	{
+		try client.ping(&ctx);
+		try ctx.expectWritten(1, &.{
+			192,                       // packet type
+			0,                         // payload length
+		});
+	}
+}
+
 test "Client: readPacket close" {
 	var ctx = TestContext.init();
 	defer ctx.deinit();
@@ -2276,6 +2298,29 @@ test "Client: readPacket pubcomp" {
 		try t.expectEqual(3, pubcomp.packet_identifier);
 		try t.expectEqual(.packet_identifier_not_found, pubcomp.reason_code);
 		try t.expectEqualSlices(u8, "nope", pubcomp.reason_string.?);
+	}
+}
+
+test "Client: readPacket pong" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+
+	{
+		// wrong flags
+		ctx.reset();
+		ctx.reply(&.{211, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// special short response
+		ctx.reset();
+		ctx.reply(&.{208, 0});
+		try t.expectEqual(true, (try client.readPacket(&ctx)) == .pong);
 	}
 }
 
