@@ -2,8 +2,6 @@ const codec = @import("codec.zig");
 const properties = @import("properties.zig");
 const PropertyReader = properties.Reader;
 
-const MIN_BUF_SIZE = 256;
-
 pub const QoS = enum(u2) {
 	at_most_once = 0,
 	at_least_once = 1,
@@ -51,7 +49,7 @@ pub const ErrorReasonCode = enum {
 	administrative_action,
 	payload_format_invalid,
 	retain_not_supported,
-	qo_s_not_supported,
+	qos_not_supported,
 	use_another_server,
 	server_moved,
 	shared_subscriptions_not_supported,
@@ -62,7 +60,7 @@ pub const ErrorReasonCode = enum {
 };
 
 // When disconnecting, we give the server one of these reasons.
-pub const DisconnectReason = enum(u8) {
+pub const ClientDisconnectReason = enum(u8) {
 	normal = 0,
 	disconnect_with_will_message = 4,
 	unspecified_error = 128,
@@ -123,7 +121,7 @@ pub const ConnectOpts = struct {
 };
 
 pub const DisconnectOpts = struct {
-	reason: DisconnectReason,
+	reason: ClientDisconnectReason,
 	session_expiry_interval: ?u32 = null,
 	reason_string: ?[]const u8 = null,
 };
@@ -148,8 +146,8 @@ pub const UnsubscribeOpts = struct {
 };
 
 pub const PublishOpts = struct {
-	message: []const u8,
 	topic: []const u8,
+	message: []const u8,
 	dup: bool = false,
 	qos: QoS = .at_most_once,
 	retain: bool = false,
@@ -187,7 +185,6 @@ pub const PubCompOpts = struct {
 	reason_string: ?[]const u8 = null,
 };
 
-
 // This is my attempt at dealing with Zig's lack of error payload. I'm trying to
 // balance returning relatively specific errors while making it easy for users
 // to handle errors (which I think is something users will want to do in some cases).
@@ -201,23 +198,7 @@ pub const ErrorDetail = union(enum) {
 	reason: ErrorReasonCode,
 };
 
-pub fn Mqtt(comptime S: type) type {
-	// Normally, you'd expect Mqtt to be created with a struct, like Mqtt(Client).
-	// Especially since all we do with S is call functions on it (we never store
-	// an S).
-	// But there are reasons why you might want to use a pointer, like Mqtt(*Client)
-	// such as in our test, where you want to S to compose a client:
-	//    const Client = struct {
-	//      mqtt: Mqtt(Client),
-	//    }
-	// But that won't compile (depending on what version of Zig, it'll just crash
-	// the compiler). But Mqtt(*Client) _will_ work.
-	const Impl = switch (@typeInfo(S)) {
-		.Struct => S,
-		.Pointer => |ptr| ptr.child,
-		else => @compileError("S must be a struct or pointer to struct"),
-	};
-
+pub fn Mqtt(comptime T: type) type {
 	return struct {
 		// buffer used for reading messages from the server. If a single message
 		// is larger than this, methods will return a error.ReadBufferIsFull
@@ -233,8 +214,6 @@ pub fn Mqtt(comptime S: type) type {
 		// message larger than this, methods will return an error.WriteBufferIsFull
 		write_buf: []u8,
 
-		disconnected: bool,
-
 		last_error: ?ErrorDetail,
 
 		// Many packets take an identifier, we increment this by one on each call
@@ -246,15 +225,7 @@ pub fn Mqtt(comptime S: type) type {
 
 		const Self = @This();
 
-		pub fn init(read_buf: []u8, write_buf: []u8) !Self {
-			if (read_buf.len < MIN_BUF_SIZE) {
-				return error.ReadBufferTooSmall;
-			}
-
-			if (write_buf.len < MIN_BUF_SIZE) {
-				return error.WriteBufferTooSmall;
-			}
-
+		pub fn init(read_buf: []u8, write_buf: []u8) Self {
 			return .{
 				.read_pos = 0,
 				.read_len = 0,
@@ -262,7 +233,6 @@ pub fn Mqtt(comptime S: type) type {
 				.write_buf = write_buf,
 				.last_error = null,
 				.packet_identifier = 1,
-				.disconnected = false, // we assume
 				.server_can_retain = true,  // we'll set this to false if connack says so
 			};
 		}
@@ -272,87 +242,63 @@ pub fn Mqtt(comptime S: type) type {
 			return self.read_buf[0..self.read_pos];
 		}
 
-		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) error{Encoding, Write}!void {
-			const connect_packet = encodeConnect(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) error{WriteBufferIsFull, Write}!void {
+			const connect_packet = try encodeConnect(self.write_buf, opts);
 			try self.writePacket(state, connect_packet);
 		}
 
-		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) error{Usage, Encoding, Write}!usize {
+		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) error{Usage, WriteBufferIsFull, Write}!usize {
 			if (opts.topics.len == 0) {
 				self.last_error = .{.details = "must have at least 1 topic"};
 				return error.Usage;
 			}
 
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-			const subscribe_packet = encodeSubscribe(self.write_buf, packet_identifier, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+			const subscribe_packet = try encodeSubscribe(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, subscribe_packet);
 			return packet_identifier;
 		}
 
-		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) error{Usage, Encoding, Write}!usize {
+		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) error{Usage, WriteBufferIsFull, Write}!usize {
 			if (opts.topics.len == 0) {
 				self.last_error = .{.details = "must have at least 1 topic"};
 				return error.Usage;
 			}
 
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-			const unsubscribe_packet = encodeUnsubscribe(self.write_buf, packet_identifier, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+			const unsubscribe_packet = try encodeUnsubscribe(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, unsubscribe_packet);
 			return packet_identifier;
 		}
 
-		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) error{Usage, Encoding, Write}!usize {
+		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) error{Usage, WriteBufferIsFull, Write}!usize {
 			if (opts.retain == true and self.server_can_retain == false) {
 				self.last_error = .{.details = "server does not support retained messages"};
 				return error.Usage;
 			}
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-			const publish_packet = encodePublish(self.write_buf, packet_identifier, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+			const publish_packet = try encodePublish(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, publish_packet);
 			return packet_identifier;
 		}
 
-		pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) error{Encoding, Write}!void {
-			const puback_packet = encodePubAck(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+		pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) error{WriteBufferIsFull, Write}!void {
+			const puback_packet = try encodePubAck(self.write_buf, opts);
 			try self.writePacket(state, puback_packet);
 		}
 
-		pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) error{Encoding, Write}!void {
-			const pubrec_packet = encodePubRec(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+		pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) error{WriteBufferIsFull, Write}!void {
+			const pubrec_packet = try encodePubRec(self.write_buf, opts);
 			try self.writePacket(state, pubrec_packet);
 		}
 
-		pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) error{Encoding, Write}!void {
-			const pubrel_packet = encodePubRel(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+		pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) error{WriteBufferIsFull, Write}!void {
+			const pubrel_packet = try encodePubRel(self.write_buf, opts);
 			try self.writePacket(state, pubrel_packet);
 		}
 
-		pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) error{Encoding, Write}!void {
-			const pubcomp_packet = encodePubComp(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+		pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) error{WriteBufferIsFull, Write}!void {
+			const pubcomp_packet = try encodePubComp(self.write_buf, opts);
 			try self.writePacket(state, pubcomp_packet);
 		}
 
@@ -362,18 +308,9 @@ pub fn Mqtt(comptime S: type) type {
 			try self.writePacket(state, &.{192, 0});
 		}
 
-		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{Encoding, Write}!void {
-			if (self.disconnected == true) {
-				return;
-			}
-
-			self.disconnected = true;
-			defer Impl.close(state);
-
-			const disconnect_packet = encodeDisconnect(self.write_buf, opts) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Encoding;
-			};
+		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{WriteBufferIsFull, Write}!void {
+			defer T.close(state);
+			const disconnect_packet = try encodeDisconnect(self.write_buf, opts);
 			return self.writePacket(state, disconnect_packet);
 		}
 
@@ -387,7 +324,7 @@ pub fn Mqtt(comptime S: type) type {
 		}
 
 		fn writePacket(self: *Self, state: anytype, data: []const u8) error{Write}!void {
-			return Impl.write(state, data) catch |err| {
+			return T.write(state, data) catch |err| {
 				self.last_error = .{.inner = err};
 				return error.Write;
 			};
@@ -397,10 +334,9 @@ pub fn Mqtt(comptime S: type) type {
 			Read,
 			Closed,
 			ReadBufferIsFull,
-			Server,
 			Protocol,
 			MalformedPacket,
-			Response,
+			Reason,
 		};
 		pub fn readPacket(self: *Self, state: anytype) ReadError!Packet {
 			const p = try self.readOrBuffered(state);
@@ -451,7 +387,7 @@ pub fn Mqtt(comptime S: type) type {
 					self.read_len = pos;
 				}
 
-				const n = Impl.read(state, buf[pos..], calls) catch |err| {
+				const n = T.read(state, buf[pos..], calls) catch |err| {
 					self.last_error = .{.inner = err};
 					return error.Read;
 				};
@@ -512,7 +448,7 @@ pub fn Mqtt(comptime S: type) type {
 			switch (connack.reason_code) {
 				0 => {}, // success
 				1...127 => return self.receivedInvalidReason(state),        // returns an error.Protocol
-				128...255 => |n| return self.receivedErrorReason(state, n), // returns an error.Response
+				128...255 => |n| return self.receivedErrorReason(n), // returns an error.Reason
 			}
 
 			if (connack.session_present) {
@@ -537,9 +473,7 @@ pub fn Mqtt(comptime S: type) type {
 			return error.Protocol;
 		}
 
-		fn receivedErrorReason(self: *Self, state: anytype, code: u8) error{Response} {
-			// MQTT-3.2.2-7
-			Impl.close(state);
+		fn receivedErrorReason(self: *Self, code: u8) error{Reason} {
 			const reason: ErrorReasonCode = switch (code) {
 				128 => .unspecified_error,
 				129 => .malformed_packet,
@@ -568,7 +502,7 @@ pub fn Mqtt(comptime S: type) type {
 				152 => .administrative_action,
 				153 => .payload_format_invalid,
 				154 => .retain_not_supported,
-				155 => .qo_s_not_supported,
+				155 => .qos_not_supported,
 				156 => .use_another_server,
 				157 => .server_moved,
 				158 => .shared_subscriptions_not_supported,
@@ -579,7 +513,7 @@ pub fn Mqtt(comptime S: type) type {
 				else => .unknown,
 			};
 			self.last_error = .{.reason = reason};
-			return error.Response;
+			return error.Reason;
 		}
 	};
 }
@@ -834,6 +768,7 @@ pub const Packet = union(enum) {
 	pubrec: PubRec,
 	pubrel: PubRel,
 	pubcomp: PubComp,
+	disconnect: Disconnect,
 	pong: void,
 
 	pub const ConnAck = struct {
@@ -971,6 +906,44 @@ pub const Packet = union(enum) {
 		reason_code: PubCompReason,
 		reason_string: ?[]const u8 = null,
 	};
+
+	pub const Disconnect = struct {
+		reason_code: ReasonCode,
+		reason_string: ?[]const u8 = null,
+		// not sure this is ever set by the server
+		session_expiry_interval: ?u32 = null,
+
+		const ReasonCode = enum(u8) {
+			normal = 0,
+			unspecified_error = 128,
+			malformed_packet = 129,
+			protocol_error = 130,
+			implementation_specific_error = 131,
+			not_authorized = 135,
+			server_busy = 137,
+			server_shutting_down = 139,
+			keepalive_timeout = 141,
+			session_taken_over = 142,
+			topic_filter_invalid = 143,
+			topic_name_invlaid = 144,
+			receive_maximum_exceeded = 147,
+			topic_alias_invalid = 148,
+			packet_too_large = 149,
+			message_rate_too_high = 150,
+			quota_exceeded = 151,
+			administrative_action = 152,
+			payload_format_invalid = 153,
+			retain_not_supported = 154,
+			qos_not_supported = 155,
+			use_another_server = 156,
+			server_moved = 157,
+			shared_subscriptions_not_supported = 158,
+			connection_rate_exceeded = 159,
+			maximum_connect_time = 160,
+			subscription_identifiers_not_supported = 161,
+			wildcard_subscriptions_not_supported = 162,
+		};
+	};
 };
 
 fn decodePacket(b1: u8, data: []u8) !Packet {
@@ -987,6 +960,7 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 		9 => return .{.suback = try decodeSubAck(data, flags)},
 		11 => return .{.unsuback = try decodeUnsubAck(data, flags)},
 		13 => return if (flags == 0) .{.pong = {}} else error.InvalidFlags,
+		14 => return .{.disconnect = try decodeDisconnect(data, flags)},
 		else => return error.UnknownPacketType, // TODO
 	}
 }
@@ -1332,6 +1306,66 @@ fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
 		}
 	}
 	return pubcomp;
+}
+
+fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
+	if (flags != 0) {
+		return error.InvalidFlags;
+	}
+
+	if (data.len < 2) {
+		// 1 for reason code
+		// 1 for 0 length properties
+		return error.IncompletePacket;
+	}
+
+	const reason_code: Packet.Disconnect.ReasonCode = switch (data[0]) {
+		0 => .normal,
+		128 => .unspecified_error,
+		129 => .malformed_packet,
+		130 => .protocol_error,
+		131 => .implementation_specific_error,
+		135 => .not_authorized,
+		137 => .server_busy,
+		139 => .server_shutting_down,
+		141 => .keepalive_timeout,
+		142 => .session_taken_over,
+		143 => .topic_filter_invalid,
+		144 => .topic_name_invlaid,
+		147 => .receive_maximum_exceeded,
+		148 => .topic_alias_invalid,
+		149 => .packet_too_large,
+		150 => .message_rate_too_high,
+		151 => .quota_exceeded,
+		152 => .administrative_action,
+		153 => .payload_format_invalid,
+		154 => .retain_not_supported,
+		155 => .qos_not_supported,
+		156 => .use_another_server,
+		157 => .server_moved,
+		158 => .shared_subscriptions_not_supported,
+		159 => .connection_rate_exceeded,
+		160 => .maximum_connect_time,
+		161 => .subscription_identifiers_not_supported,
+		162 => .wildcard_subscriptions_not_supported,
+		else => return error.Protocol,
+	};
+
+	var disconnect = Packet.Disconnect{
+		.reason_code = reason_code,
+	};
+
+	var props = try PropertyReader.init(data[1..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.reason_string => |v| disconnect.reason_string = v,
+			.session_expiry_interval => |v| disconnect.session_expiry_interval = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+
+	return disconnect;
 }
 
 const t = @import("std").testing;
@@ -1852,9 +1886,9 @@ test "Client: readPacket connack" {
 		// return with error reason code
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 133, 0});
-		try t.expectError(error.Response, client.readPacket(&ctx));
+		try t.expectError(error.Reason, client.readPacket(&ctx));
 		try t.expectEqual(.client_identifier_not_valid, client.last_error.?.reason);
-		try t.expectEqual(1, ctx.close_count);
+		try t.expectEqual(0, ctx.close_count);
 	}
 
 	{
@@ -2324,6 +2358,40 @@ test "Client: readPacket pong" {
 	}
 }
 
+test "Client: readPacket disconnect" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+
+	{
+		// wrong flags
+		ctx.reset();
+		ctx.reply(&.{225, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// short response
+		ctx.reset();
+		ctx.reply(&.{224, 2, 0, 0});
+		const disconnect = (try client.readPacket(&ctx)).disconnect;
+		try t.expectEqual(.normal, disconnect.reason_code);
+		try t.expectEqual(null, disconnect.reason_string);
+	}
+
+	{
+		// short response
+		ctx.reset();
+		ctx.reply(&.{224, 8, 135, 6, 31, 0, 3, 'b', 'y', 'e'});
+		const disconnect = (try client.readPacket(&ctx)).disconnect;
+		try t.expectEqual(.not_authorized, disconnect.reason_code);
+		try t.expectEqualSlices(u8, "bye", disconnect.reason_string.?);
+	}
+}
+
 const TestContext = struct {
 	arena: *std.heap.ArenaAllocator,
 	to_read_pos: usize,
@@ -2332,7 +2400,7 @@ const TestContext = struct {
 	write_count: usize,
 	close_count: usize,
 	_random: ?std.rand.DefaultPrng = null,
-	client: Mqtt(*TestContext),
+	client: Mqtt(TestContext),
 
 	const std = @import("std");
 
@@ -2342,8 +2410,8 @@ const TestContext = struct {
 
 		const allocator = arena.allocator();
 
-		const read_buf = allocator.alloc(u8, MIN_BUF_SIZE) catch unreachable;
-		const write_buf = allocator.alloc(u8, MIN_BUF_SIZE) catch unreachable;
+		const read_buf = allocator.alloc(u8, 256) catch unreachable;
+		const write_buf = allocator.alloc(u8, 256) catch unreachable;
 
 		return .{
 			.arena = arena,
@@ -2352,7 +2420,7 @@ const TestContext = struct {
 			.written = std.ArrayList(u8).init(allocator),
 			.write_count = 0,
 			.close_count = 0,
-			.client = Mqtt(*TestContext).init(read_buf, write_buf) catch unreachable,
+			.client = Mqtt(TestContext).init(read_buf, write_buf),
 		};
 	}
 
@@ -2368,7 +2436,6 @@ const TestContext = struct {
 		self.to_read.clearRetainingCapacity();
 		self.written.clearRetainingCapacity();
 
-		self.client.disconnected = false;
 		self.client.server_can_retain = true;
 	}
 
