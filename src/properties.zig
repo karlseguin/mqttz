@@ -111,6 +111,9 @@ pub const PUBREC = PUBACK;
 pub const PUBREL = PUBACK;
 pub const PUBCOMP = PUBACK;
 
+// it only accepts user data, which we don't support (yet)
+pub const UNSUBSCRIBE = [_]PropertyType{};
+
 pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyType) error{WriteBufferIsFull}!usize {
 	const properties_len = writeLen(value, properties);
 	const length_of_len = codec.lengthOfVarint(properties_len);

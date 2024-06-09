@@ -142,6 +142,11 @@ pub const SubscribeOpts = struct {
 	};
 };
 
+pub const UnsubscribeOpts = struct {
+	packet_identifier: ?u16 = null,
+	topics: []const []const u8,
+};
+
 pub const PublishOpts = struct {
 	message: []const u8,
 	topic: []const u8,
@@ -181,6 +186,7 @@ pub const PubCompOpts = struct {
 	reason_code: PubCompReason = .success,
 	reason_string: ?[]const u8 = null,
 };
+
 
 // This is my attempt at dealing with Zig's lack of error payload. I'm trying to
 // balance returning relatively specific errors while making it easy for users
@@ -286,6 +292,21 @@ pub fn Mqtt(comptime S: type) type {
 				return error.Encoding;
 			};
 			try self.writePacket(state, subscribe_packet);
+			return packet_identifier;
+		}
+
+		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) error{Usage, Encoding, Write}!usize {
+			if (opts.topics.len == 0) {
+				self.last_error = .{.details = "must have at least 1 topic"};
+				return error.Usage;
+			}
+
+			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+			const unsubscribe_packet = encodeUnsubscribe(self.write_buf, packet_identifier, opts) catch |err| {
+				self.last_error = .{.inner = err};
+				return error.Encoding;
+			};
+			try self.writePacket(state, unsubscribe_packet);
 			return packet_identifier;
 		}
 
@@ -663,6 +684,21 @@ fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: SubscribeOpts) ![]u8
 	return encodePacketHeader(buf[0..pos], 8, 2);
 }
 
+fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: UnsubscribeOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	codec.writeInt(u16, buf[5..7], packet_identifier);
+	const PROPERTIES_OFFSET = 7;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.UNSUBSCRIBE);
+
+	var pos = PROPERTIES_OFFSET + properties_len;
+	for (opts.topics) |topic| {
+		pos += try codec.writeString(buf[pos..], topic);
+	}
+
+	return encodePacketHeader(buf[0..pos], 10, 2);
+}
+
 fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
 	var publish_flags = PublishFlags{
 		.dup = opts.dup,
@@ -786,6 +822,7 @@ fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
 pub const Packet = union(enum) {
 	connack: ConnAck,
 	suback: SubAck,
+	unsuback: UnsubAck,
 	publish: Publish,
 	puback: PubAck,
 	pubrec: PubRec,
@@ -818,48 +855,69 @@ pub const Packet = union(enum) {
 		reason_string: ?[]const u8 = null,
 		results: []const u8,
 
-		const Result = union(enum) {
-			granted: QoS,
-			err: Error,
-			invalid_index: void,
-
-			const Error = enum {
-				unspecified_error,
-				implementation_specific_error,
-				not_authorized,
-				topic_filter_invalid,
-				packet_identifier_in_use,
-				quota_exceeded,
-				shared_subscriptions_not_supported,
-				subscription_identifier_not_supported,
-				wildcard_subscriptions_not_supported,
-				unknown,
-			};
+		const Error = error {
+			Protocol,
+			Unspecified,
+			ImplementationSpecific,
+			NotAuthorized,
+			TopicFilterInvalid,
+			PacketIdentifierInUse,
+			QuotaExceeded,
+			SharedSubscriptionsNotSupported,
+			SubscriptionIdentifierNotSupported,
+			WildcardSubscriptionsNotSupported,
 		};
 
-		pub fn result(self: *const SubAck, topic_index: usize) Result {
-				const results = self.results;
+		pub fn result(self: *const SubAck, topic_index: usize) SubAck.Error!QoS {
+			const results = self.results;
 
-				if (topic_index > results.len) {
-					return .{.invalid_index = {}};
-				}
-
-				switch (results[topic_index]) {
-					0 => return .{.granted = .at_most_once},
-					1 => return .{.granted = .at_least_once},
-					2 => return .{.granted = .exactly_once},
-					128 => return .{.err = .unspecified_error},
-					131 => return .{.err = .implementation_specific_error},
-					135 => return .{.err = .not_authorized},
-					143 => return .{.err = .topic_filter_invalid},
-					145 => return .{.err = .packet_identifier_in_use},
-					151 => return .{.err = .quota_exceeded},
-					158 => return .{.err = .shared_subscriptions_not_supported},
-					161 => return .{.err = .subscription_identifier_not_supported},
-					162 => return .{.err = .wildcard_subscriptions_not_supported},
-					else => return .{.err = .unknown},
-				}
+			switch (results[topic_index]) {
+				0 => return .at_most_once,
+				1 => return .at_least_once,
+				2 => return .exactly_once,
+				128 => return error.Unspecified,
+				131 => return error.ImplementationSpecific,
+				135 => return error.NotAuthorized,
+				143 => return error.TopicFilterInvalid,
+				145 => return error.PacketIdentifierInUse,
+				151 => return error.QuotaExceeded,
+				158 => return error.SharedSubscriptionsNotSupported,
+				161 => return error.SubscriptionIdentifierNotSupported,
+				162 => return error.WildcardSubscriptionsNotSupported,
+				else => return error.Protocol,
 			}
+		}
+	};
+
+	pub const UnsubAck = struct {
+		packet_identifier: u16,
+		reason_string: ?[]const u8 = null,
+		results: []const u8,
+
+		const Error = error {
+			Protocol,
+			NoSubscriptionExisted,
+			Unspecified,
+			ImplementationSpecific,
+			NotAuthorized,
+			TopicFilterInvalid,
+			PacketIdentifierInUse,
+		};
+
+		pub fn result(self: *const UnsubAck, topic_index: usize) UnsubAck.Error!void {
+			const results = self.results;
+
+			switch (results[topic_index]) {
+				0 => return,
+				17 => return error.NoSubscriptionExisted,
+				128 => return error.Unspecified,
+				131 => return error.ImplementationSpecific,
+				135 => return error.NotAuthorized,
+				143 => return error.TopicFilterInvalid,
+				145 => return error.PacketIdentifierInUse,
+				else => return error.Protocol,
+			}
+		}
 	};
 
 	pub const Publish = struct {
@@ -920,6 +978,7 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 		6 => return .{.pubrel = try decodePubRel(data, flags)},
 		7 => return .{.pubcomp = try decodePubComp(data, flags)},
 		9 => return .{.suback = try decodeSubAck(data, flags)},
+		11 => return .{.unsuback = try decodeUnsubAck(data, flags)},
 		else => return error.UnknownPacketType, // TODO
 	}
 }
@@ -1003,9 +1062,44 @@ fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
 	// the rest of the packet is the payload, and the payload is 1 or more
 	// 1 byte reason codes. 1 reason code per subscribed topic (in the same order)
 	// So if you subscribed to 2 topics and want to know the result of the 2nd one
-	// you would check suback.results[1].
+	// you would check suback.results[1], or better for an enum value: suback.result(1).
 	suback.results = data[2 + props.len..];
 	return suback;
+}
+
+fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
+	if (flags != 0) {
+		return error.InvalidFlags;
+	}
+
+	if (data.len < 4) {
+		// must have at least 4 bytes
+		// 2 for the packet identifier
+		// at least 1 for a 0-length property list
+		// at least 1 for 1 reason code in the body
+		return error.IncompletePacket;
+	}
+
+	var unsuback = Packet.UnsubAck{
+		.packet_identifier = codec.readInt(u16, data[0..2]),
+		.results = undefined,
+	};
+
+	var props = try PropertyReader.init(data[2..]);
+	while (try props.next()) |prop| {
+		switch (prop) {
+			.reason_string => |v| unsuback.reason_string = v,
+			.user_property => {}, // TODO: handle
+			else => return error.InvalidProperty,
+		}
+	}
+
+	// the rest of the packet is the payload, and the payload is 1 or more
+	// 1 byte reason codes. 1 reason code per unsubscribed topic (in the same order)
+	// So if you unsubscribed to 2 topics and want to know the result of the 2nd one
+	// you would check unsuback.results[1], or better for an enum value: unsuback.result(1).
+	unsuback.results = data[2 + props.len..];
+	return unsuback;
 }
 
 fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
@@ -1347,6 +1441,36 @@ test "Client: subscribe" {
 	}
 }
 
+test "Client: unsubscribe" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		// empty topic
+		try t.expectError(error.Usage, client.unsubscribe(&ctx, .{.topics = &.{}}));
+		try t.expectEqualSlices(u8, "must have at least 1 topic", client.last_error.?.details);
+	}
+
+	{
+		const pi = try client.unsubscribe(&ctx, .{
+			.packet_identifier = 10,
+			.topics = &.{"topic11!"},  // always need 1 topic
+		});
+
+		try t.expectEqual(10, pi);
+
+		try ctx.expectWritten(1, &.{
+			162,                       // packet type (1010 0010)  (10 for the packet type, and 2 for the flag, the flag is always 2)
+			13,                        // payload length
+			0, 10,                     // packet identifier
+			0,                         // property length
+			0, 8, 't', 'o', 'p', 'i', 'c', '1', '1', '!'
+		});
+	}
+}
+
 test "Client: publish" {
 	var ctx = TestContext.init();
 	defer ctx.deinit();
@@ -1605,7 +1729,6 @@ test "Client: pubcomp" {
 	}
 }
 
-
 test "Client: disconnect" {
 	var ctx = TestContext.init();
 	defer ctx.deinit();
@@ -1844,8 +1967,7 @@ test "Client: readPacket suback" {
 		try t.expectEqual(258, suback.packet_identifier);
 		try t.expectEqual(null, suback.reason_string);
 		try t.expectEqualSlices(u8, &.{1}, suback.results);
-		try t.expectEqual(.at_least_once, suback.result(0).granted);
-		try t.expectEqual({}, suback.result(2).invalid_index);
+		try t.expectEqual(.at_least_once, try suback.result(0));
 	}
 
 	{
@@ -1863,9 +1985,65 @@ test "Client: readPacket suback" {
 		try t.expectEqual(1, suback.packet_identifier);
 		try t.expectEqualSlices(u8, "ok", suback.reason_string.?);
 		try t.expectEqualSlices(u8, &.{2, 135, 4}, suback.results);
-		try t.expectEqual(.exactly_once, suback.result(0).granted);
-		try t.expectEqual(.not_authorized, suback.result(1).err);
-		try t.expectEqual(.unknown, suback.result(2).err);
+		try t.expectEqual(.exactly_once, try suback.result(0));
+		try t.expectError(error.NotAuthorized, suback.result(1));
+	}
+}
+
+test "Client: readPacket unsuback" {
+	var ctx = TestContext.init();
+	defer ctx.deinit();
+
+	var client = &ctx.client;
+
+	{
+		ctx.reset();
+		// return with invalid packet flags
+		// first byte should always be 176. 178 means that the flags were improperly
+		// set (they should always be 0 for unsuback)
+		ctx.reply(&.{178, 4, 0, 0, 0, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(error.InvalidFlags, client.last_error.?.inner);
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// short packet (must be at least 6 bytes)
+		ctx.reset();
+		ctx.reply(&.{176, 3, 0, 0, 0});
+		try t.expectError(error.MalformedPacket, client.readPacket(&ctx));
+		try t.expectEqual(0, ctx.close_count);
+	}
+
+	{
+		// basic response
+		ctx.reset();
+		ctx.reply(&.{176, 4, 2, 2, 0, 0});
+		const unsuback = (try client.readPacket(&ctx)).unsuback;
+		try t.expectEqual(514, unsuback.packet_identifier);
+		try t.expectEqual(null, unsuback.reason_string);
+		try t.expectEqualSlices(u8, &.{0}, unsuback.results);
+		try unsuback.result(0); // returns void on success
+	}
+
+	{
+		// multi-topic response
+		ctx.reset();
+		ctx.reply(&.{
+			176,
+			11,
+			0, 1,  // packet identifier
+			5,     // property length
+			31, 0, 2, 'o', 'k',  // reason
+			2, 135, 17,   // 3 reasons
+		});
+		const unsuback = (try client.readPacket(&ctx)).unsuback;
+		try t.expectEqual(1, unsuback.packet_identifier);
+		try t.expectEqualSlices(u8, "ok", unsuback.reason_string.?);
+		try t.expectEqualSlices(u8, &.{2, 135, 17}, unsuback.results);
+		try t.expectError(error.Protocol, unsuback.result(0));
+		try t.expectError(error.NotAuthorized, unsuback.result(1));
+		try t.expectError(error.NoSubscriptionExisted, unsuback.result(2));
 	}
 }
 
