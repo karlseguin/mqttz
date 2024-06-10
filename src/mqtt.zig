@@ -223,6 +223,10 @@ pub fn Mqtt(comptime T: type) type {
 		// If it does get set to false, we'll error on any publish where retain = true
 		server_can_retain: bool,
 
+		// If, in connack, the server tells us its maximum supported QoS, we'll
+		// reject any publish with a higher QoS.
+		server_max_qos: u2,
+
 		const Self = @This();
 
 		pub fn init(read_buf: []u8, write_buf: []u8) Self {
@@ -234,6 +238,7 @@ pub fn Mqtt(comptime T: type) type {
 				.last_error = null,
 				.packet_identifier = 1,
 				.server_can_retain = true,  // we'll set this to false if connack says so
+				.server_max_qos = @intFromEnum(QoS.exactly_once), // can be changed based on connack response
 			};
 		}
 
@@ -274,6 +279,10 @@ pub fn Mqtt(comptime T: type) type {
 		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) error{Usage, WriteBufferIsFull, Write}!usize {
 			if (opts.retain == true and self.server_can_retain == false) {
 				self.last_error = .{.details = "server does not support retained messages"};
+				return error.Usage;
+			}
+			if (@intFromEnum(opts.qos) > self.server_max_qos) {
+				self.last_error = .{.details = "server does not support this level of QoS"};
 				return error.Usage;
 			}
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
@@ -458,6 +467,10 @@ pub fn Mqtt(comptime T: type) type {
 
 			if (connack.retain_available) |ra| {
 				self.server_can_retain = ra;
+			}
+
+			if (connack.maximum_qos) |max| {
+				self.server_max_qos = @intFromEnum(max);
 			}
 		}
 	};
@@ -1539,6 +1552,14 @@ test "Client: publish" {
 	}
 
 	{
+		// can't publish wih higher QoS than server supports
+		// (the server should treat this as an error, so we might as well catch it in the library)
+		client.server_max_qos = @intFromEnum(QoS.at_most_once);
+		try t.expectError(error.Usage, client.publish(&ctx, .{.qos = .at_least_once, .topic = "", .message = ""}));
+		try t.expectEqualSlices(u8, "server does not support this level of QoS", client.last_error.?.details);
+	}
+
+	{
 		// publish qos = .at_least_once (no packet identifier)
 		ctx.reset();
 		const pi = try client.publish(&ctx, .{
@@ -2456,6 +2477,7 @@ const TestContext = struct {
 		self.written.clearRetainingCapacity();
 
 		self.client.server_can_retain = true;
+		self.client.server_max_qos = @intFromEnum(QoS.exactly_once);
 	}
 
 	fn reply(self: *TestContext, data: []const u8) void {

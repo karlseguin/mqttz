@@ -22,7 +22,7 @@ pub fn main() !void {
 	const stream = try std.net.tcpConnectToAddress(address);
 	// will get closed when client.disconnect() is closed
 
-	var read_buf: [4098]u8 = undefined;
+	var read_buf: [4096]u8 = undefined;
 
 	// we never write very big messages. The longest part of our message is
 	// the topic name that we subscribe to (plus a few bytes of overhead in the
@@ -37,7 +37,10 @@ pub fn main() !void {
 
 	// in our connect, we call readPacket and return the mqttz.Packet.Connack
 	// this packet might have useful information about the server's capabilities.
-	_ = try client.connect(.{});
+	_ = try client.connect(.{
+		.maximum_packet_size = 4096,
+
+	});
 
 	try client.subscribe("power/goku");
 
@@ -93,7 +96,7 @@ const Client = struct {
 	fn subscribe(self: *Client, topic: []const u8) !void {
 		const packet_identifier = try self.mqtt.subscribe(self, .{
 			.topics = &.{
-				.{.filter = topic},
+				.{.filter = topic, .qos = .at_most_once},
 			},
 		});
 
@@ -113,10 +116,13 @@ const Client = struct {
 					if (suback.packet_identifier != packet_identifier) {
 						return error.WrongPacketIdentifier;
 					}
-					// this will return an error if the result for our first topic
-					// isn't success. On success, this returns the mqtt.QoS that maybe
-					// we should care about
-					_ = try suback.result(0);
+
+					// our implementation asked for at_most_once
+					// it should have gotten a suback with at_most_once
+					// we can't handle anything more (in this implementation)
+					if (try suback.result(0) != .at_most_once) {
+						return error.UnexpectedQOS;
+					}
 					return;
 				},
 				else => {

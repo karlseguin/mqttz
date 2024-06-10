@@ -87,6 +87,7 @@ const Client = struct {
 		_ = try self.mqtt.publish(self, .{
 			.topic = topic,
 			.message = message,
+			.qos = .at_most_once, // this is the default, but let's be explicit
 		});
 	}
 
