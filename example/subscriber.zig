@@ -39,7 +39,10 @@ pub fn main() !void {
 	// this packet might have useful information about the server's capabilities.
 	_ = try client.connect(.{
 		.maximum_packet_size = 4096,
-
+			.user_properties = &.{
+				.{.key = "client", .value = "mqttz"},
+				.{.key = "example", .value = "subscriber"},
+			}
 	});
 
 	try client.subscribe("power/goku");

@@ -24,7 +24,7 @@ pub const PropertyType = enum(u8) {
 	topic_alias = 35,
 	maximum_qos = 36,
 	retain_available = 37,
-	user_property = 38,
+	user_properties = 38,
 	maximum_packet_size = 39,
 	wildcard_subscription_available = 40,
 	subscription_identifier_available = 41,
@@ -56,7 +56,7 @@ pub const Property = union(PropertyType) {
 	topic_alias: u16,
 	maximum_qos: mqtt.QoS,
 	retain_available: bool,
-	user_property: []const u8,
+	user_properties: []const u8,
 	maximum_packet_size: u32,
 	wildcard_subscription_available: bool,
 	subscription_identifier_available: bool,
@@ -74,6 +74,7 @@ pub const CONNECT = [_]PropertyType{
 	.session_expiry_interval,
 	.receive_maximum,
 	.maximum_packet_size,
+	.user_properties,
 };
 
 pub const WILL = [_]PropertyType{
@@ -88,10 +89,12 @@ pub const WILL = [_]PropertyType{
 pub const DISCONNECT = [_]PropertyType{
 	.session_expiry_interval,
 	.reason_string,
+	.user_properties,
 };
 
 pub const SUBSCRIBE = [_]PropertyType{
 	.subscription_identifier,
+	.user_properties,
 };
 
 pub const PUBLISH = [_]PropertyType{
@@ -102,10 +105,12 @@ pub const PUBLISH = [_]PropertyType{
 	.correlation_data,
 	.subscription_identifier,
 	.content_type,
+	.user_properties,
 };
 
 pub const PUBACK = [_]PropertyType{
-	.reason_string
+	.reason_string,
+	.user_properties,
 };
 pub const PUBREC = PUBACK;
 pub const PUBREL = PUBACK;
@@ -125,26 +130,38 @@ pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyTyp
 	var pos: usize = length_of_len;
 	inline for (properties) |property| {
 		if (@field(value, @tagName(property))) |v| {
-			buf[pos] = @intFromEnum(property);
-
-			pos += 1;
 			switch (@TypeOf(v)) {
 				u16 => {
+					buf[pos] = @intFromEnum(property);
+					pos += 1;
 					const end = pos + 2;
 					codec.writeInt(u16, buf[pos..end][0..2], v);
 					pos = end;
 				},
 				u32 => {
+					buf[pos] = @intFromEnum(property);
+					pos += 1;
 					const end = pos + 4;
 					codec.writeInt(u32, buf[pos..end][0..4], v);
 					pos = end;
 				},
-				[]const u8 => pos += try codec.writeString(buf[pos..], v),
+				[]const u8 => {
+					buf[pos] = @intFromEnum(property);
+					pos += 1;
+					pos += try codec.writeString(buf[pos..], v);
+				},
+				[]const mqtt.UserProperty => for (v) |up| {
+					buf[pos] = @intFromEnum(property);
+					pos += 1;
+					pos += try codec.writeString(buf[pos..], up.key);
+					pos += try codec.writeString(buf[pos..], up.value);
+				},
 				else => {
 					switch (@typeInfo(@TypeOf(v))) {
 						.Enum => {
-							buf[pos] = @intFromEnum(v);
-							pos += 1;
+							buf[pos] = @intFromEnum(property);
+							buf[pos + 1] = @intFromEnum(v);
+							pos += 2;
 						},
 						else => unreachable,
 					}
@@ -161,18 +178,24 @@ fn writeLen(value: anytype, comptime properties: []const PropertyType) usize {
 	inline for (properties) |property| {
 		// all fields are nullable, null properties aren't serialized
 		if (@field(value, @tagName(property))) |v| {
-			// +1 for the identifier
-			l += 1 + switch (@TypeOf(v)) {
-				u16 => 2,
-				u32 => 4,
-				[]const u8 => 2 + v.len, // + 2 for the length prefix
-				else => blk: {
+			// these all have a +1 for the extra property type
+			// except user.UserProperty which has a +1 for each value
+			switch (@TypeOf(v)) {
+				u16 => l += 3,
+				u32 => l += 5,
+				[]const u8 => l += 3 + v.len, // + 2 for the length prefix
+				[]const mqtt.UserProperty => for (v) |up| {
+					// + 4 for the two length prefixes
+					// + 1 for the property type
+					l += up.key.len + up.value.len + 5;
+				},
+				else => {
 					switch (@typeInfo(@TypeOf(v))) {
-						.Enum => break :blk 1,
+						.Enum => l += 2,
 						else => unreachable,
 					}
 				},
-			};
+			}
 		}
 	}
 	return l;

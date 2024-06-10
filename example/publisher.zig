@@ -38,7 +38,12 @@ pub fn main() !void {
 
 	// in our connect, we call readPacket and return the mqttz.Packet.Connack
 	// this packet might have useful information about the server's capabilities.
-	_ = try client.connect(.{});
+	_ = try client.connect(.{
+		.user_properties = &.{
+			.{.key = "client", .value = "mqttz"},
+			.{.key = "example", .value = "publisher"},
+		}
+	});
 
 	var buf: [50]u8 = undefined;
 	for (9000..9003) |i| {

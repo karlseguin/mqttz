@@ -96,6 +96,11 @@ pub const PubRelReason = enum(u8) {
 };
 pub const PubCompReason = PubRelReason;
 
+pub const UserProperty = struct {
+	key: []const u8,
+	value: []const u8,
+};
+
 pub const ConnectOpts = struct {
 	client_id: ?[]const u8 = null,
 	username: ?[]const u8 = null,
@@ -105,6 +110,7 @@ pub const ConnectOpts = struct {
 	session_expiry_interval: ?u32 = null,
 	receive_maximum: ?u16 = null,
 	maximum_packet_size: ?u32 = null,
+	user_properties: ?[]const UserProperty = null,
 
 	pub const Will = struct {
 		topic: []const u8,
@@ -124,12 +130,14 @@ pub const DisconnectOpts = struct {
 	reason: ClientDisconnectReason,
 	session_expiry_interval: ?u32 = null,
 	reason_string: ?[]const u8 = null,
+	user_properties: ?[]const UserProperty = null,
 };
 
 pub const SubscribeOpts = struct {
 	packet_identifier: ?u16 = null,
 	subscription_identifier: ?usize = null,
 	topics: []const Topic,
+	user_properties: ?[]const UserProperty = null,
 
 	pub const Topic = struct {
 		filter: []const u8,
@@ -159,30 +167,35 @@ pub const PublishOpts = struct {
 	correlation_data: ?[]const u8 = null,
 	subscription_identifier:? usize = null,
 	content_type: ?[]const u8 = null,
+	user_properties: ?[]const UserProperty = null,
 };
 
 pub const PubAckOpts = struct {
 	packet_identifier: u16,
 	reason_code: PubAckReason = .success,
 	reason_string: ?[]const u8 = null,
+	user_properties: ?[]const UserProperty = null,
 };
 
 pub const PubRecOpts = struct {
 	packet_identifier: u16,
 	reason_code: PubRecReason = .success,
 	reason_string: ?[]const u8 = null,
+	user_properties: ?[]const UserProperty = null,
 };
 
 pub const PubRelOpts = struct {
 	packet_identifier: u16,
 	reason_code: PubRelReason = .success,
 	reason_string: ?[]const u8 = null,
+	user_properties: ?[]const UserProperty = null,
 };
 
 pub const PubCompOpts = struct {
 	packet_identifier: u16,
 	reason_code: PubCompReason = .success,
 	reason_string: ?[]const u8 = null,
+	user_properties: ?[]const UserProperty = null,
 };
 
 // This is my attempt at dealing with Zig's lack of error payload. I'm trying to
@@ -1026,7 +1039,7 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 			.server_reference => |v| connack.server_reference = v,
 			.authentication_method => |v| connack.authentication_method = v,
 			.authentication_data => |v| connack.authentication_data = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1056,7 +1069,7 @@ fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| suback.reason_string = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1091,7 +1104,7 @@ fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| unsuback.reason_string = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1140,7 +1153,7 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
 			.correlation_data => |v| publish.correlation_data = v,
 			.subscription_identifier => |v| publish.subscription_identifier = v,
 			.content_type => |v| publish.content_type = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1190,7 +1203,7 @@ fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| puback.reason_string = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1238,7 +1251,7 @@ fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| pubrec.reason_string = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1281,7 +1294,7 @@ fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| pubrel.reason_string = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1325,7 +1338,7 @@ fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| pubcomp.reason_string = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1384,7 +1397,7 @@ fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
 		switch (prop) {
 			.reason_string => |v| disconnect.reason_string = v,
 			.session_expiry_interval => |v| disconnect.session_expiry_interval = v,
-			.user_property => {}, // TODO: handle
+			.user_properties => {}, // TODO: handle
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1437,20 +1450,26 @@ test "Client: connect" {
 			.session_expiry_interval = 20,
 			.receive_maximum = 300,
 			.maximum_packet_size = 4000,
+			.user_properties = &.{
+				.{.key = "k1", .value = "value-1"},
+				.{.key = "key-2", .value = "v2"},
+			}
 		});
 		try ctx.expectWritten(1, &.{
 			16,                        // packet type
-			116,                       // payload length
+			142, 1,                    // payload length
 			0, 4, 'M', 'Q', 'T', 'T',  // protocol name
 			5,                         // protocol version
 			246,                       // connect flags (1, 1, 1, 1, 0, 1, 1, 0)
 			                           //               the last 0 is reserved, the middle 0 comes from the "2" (1, 0) of the will qos.
 			1, 44,                     // keepalive sec
 
-			13,                             // properties length
-			0x11, 0, 0, 0, 0x14,            // session expiry interval property
-			0x21, 0x01, 0x2c,               // receive maximum property
-			0x27, 0x00, 0x00, 0x0f, 0xa0,   // maximum packet size interval property
+			39,                       // properties length
+			17, 0, 0, 0, 20,          // session expiry interval property
+			33, 1, 44,                // receive maximum property
+			39, 0, 0, 15, 160,        // maximum packet size interval property
+			38, 0, 2, 'k', '1', 0, 7, 'v', 'a', 'l', 'u', 'e', '-', '1',
+			38, 0, 5, 'k', 'e', 'y', '-', '2', 0, 2, 'v', '2',
 
 			// payload
 			0, 10,                     // client_id length
