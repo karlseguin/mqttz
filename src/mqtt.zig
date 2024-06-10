@@ -771,6 +771,11 @@ pub const Packet = union(enum) {
 		server_reference: ?[]const u8 = null,
 		authentication_method: ?[]const u8 = null,
 		authentication_data: ?[]const u8 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const ConnAck) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 
 		pub const ReasonCode = enum(u8) {
 			success = 0,
@@ -802,6 +807,11 @@ pub const Packet = union(enum) {
 		packet_identifier: u16,
 		reason_string: ?[]const u8 = null,
 		results: []const u8,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const SubAck) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 
 		const Error = error {
 			Protocol,
@@ -841,6 +851,11 @@ pub const Packet = union(enum) {
 		packet_identifier: u16,
 		reason_string: ?[]const u8 = null,
 		results: []const u8,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const UnsubAck) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 
 		const Error = error {
 			Protocol,
@@ -888,30 +903,55 @@ pub const Packet = union(enum) {
 		correlation_data: ?[]const u8 = null,
 		subscription_identifier: ?usize = null,
 		content_type: ?[]const u8 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const Publish) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 	};
 
 	pub const PubAck = struct {
 		packet_identifier: u16,
 		reason_code: PubAckReason,
 		reason_string: ?[]const u8 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const PubAck) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 	};
 
 	pub const PubRec = struct {
 		packet_identifier: u16,
 		reason_code: PubRecReason,
 		reason_string: ?[]const u8 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const PubRec) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 	};
 
 	pub const PubRel = struct {
 		packet_identifier: u16,
 		reason_code: PubRelReason,
 		reason_string: ?[]const u8 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const PubRel) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 	};
 
 	pub const PubComp = struct {
 		packet_identifier: u16,
 		reason_code: PubCompReason,
 		reason_string: ?[]const u8 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const PubComp) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 	};
 
 	pub const Disconnect = struct {
@@ -919,6 +959,11 @@ pub const Packet = union(enum) {
 		reason_string: ?[]const u8 = null,
 		// not sure this is ever set by the server
 		session_expiry_interval: ?u32 = null,
+		_user_properties: ?[]const u8 = null,
+
+		pub fn userProperties(self: *const Disconnect) properties.UserPropertyIterator {
+			return properties.UserPropertyIterator.init(self._user_properties orelse "");
+		}
 
 		pub const ReasonCode = enum(u8) {
 			normal = 0,
@@ -1039,7 +1084,11 @@ fn decodePacket(b1: u8, data: []u8) !Packet {
 			.server_reference => |v| connack.server_reference = v,
 			.authentication_method => |v| connack.authentication_method = v,
 			.authentication_data => |v| connack.authentication_data = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (connack._user_properties == null) {
+					connack._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1069,7 +1118,11 @@ fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| suback.reason_string = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (suback._user_properties == null) {
+					suback._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1104,7 +1157,11 @@ fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| unsuback.reason_string = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (unsuback._user_properties == null) {
+					unsuback._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1153,7 +1210,11 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
 			.correlation_data => |v| publish.correlation_data = v,
 			.subscription_identifier => |v| publish.subscription_identifier = v,
 			.content_type => |v| publish.content_type = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (publish._user_properties == null) {
+					publish._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1203,7 +1264,11 @@ fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| puback.reason_string = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (puback._user_properties == null) {
+					puback._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1251,7 +1316,11 @@ fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| pubrec.reason_string = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (pubrec._user_properties == null) {
+					pubrec._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1294,7 +1363,11 @@ fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| pubrel.reason_string = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (pubrel._user_properties == null) {
+					pubrel._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1338,7 +1411,11 @@ fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
 	while (try props.next()) |prop| {
 		switch (prop) {
 			.reason_string => |v| pubcomp.reason_string = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (pubcomp._user_properties == null) {
+					pubcomp._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -1397,7 +1474,11 @@ fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
 		switch (prop) {
 			.reason_string => |v| disconnect.reason_string = v,
 			.session_expiry_interval => |v| disconnect.session_expiry_interval = v,
-			.user_properties => {}, // TODO: handle
+			.user_properties => |v| {
+				if (disconnect._user_properties == null) {
+					disconnect._user_properties = v;
+				}
+			},
 			else => return error.InvalidProperty,
 		}
 	}
@@ -2424,7 +2505,6 @@ test "Client: readPacket disconnect" {
 
 	var client = &ctx.client;
 
-
 	{
 		// wrong flags
 		ctx.reset();
@@ -2439,15 +2519,41 @@ test "Client: readPacket disconnect" {
 		const disconnect = (try client.readPacket(&ctx)).disconnect;
 		try t.expectEqual(.normal, disconnect.reason_code);
 		try t.expectEqual(null, disconnect.reason_string);
+
+		var it = disconnect.userProperties();
+		try t.expectEqual(null, it.next());
 	}
 
 	{
-		// short response
+		// with user properties
 		ctx.reset();
-		ctx.reply(&.{224, 8, 135, 6, 31, 0, 3, 'b', 'y', 'e'});
+		ctx.reply(&.{
+			224,
+			27,                                       // length
+			135,                                      // reason code
+			25,                                       // properties length
+			38, 0, 1, 'a', 0, 3, '1', '2', '3',       // one user property
+			31, 0, 3, 'b', 'y', 'e',                  // reason string
+			38, 0, 3, 'a', 'b', 'c', 0, 2, 'z', '!'   // another user porperty
+		});
 		const disconnect = (try client.readPacket(&ctx)).disconnect;
 		try t.expectEqual(.not_authorized, disconnect.reason_code);
 		try t.expectEqualSlices(u8, "bye", disconnect.reason_string.?);
+
+		var it = disconnect.userProperties();
+		{
+			const up = it.next().?;
+			try t.expectEqualSlices(u8, "a", up.key);
+			try t.expectEqualSlices(u8, "123", up.value);
+		}
+
+		{
+			const up = it.next().?;
+			try t.expectEqualSlices(u8, "abc", up.key);
+			try t.expectEqualSlices(u8, "z!", up.value);
+		}
+
+		try t.expectEqual(null, it.next());
 	}
 }
 

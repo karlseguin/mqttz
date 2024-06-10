@@ -348,5 +348,18 @@ Like `subscribe` and `suback`, `unsubscribe` and `unsuback` also allow multiple 
 * `error.TopicFilterInvalid`
 * `error.PacketIdentifierInUse`
 
+### User Properties
+All of these packets, except `pong` might have user properties. These are exposes as an iterator:
+
+```zig
+var it = suback.userPropertis();
+while (it.next()) |up| {
+    // up.key
+    // up.value
+}
+```
+
+The key and value are only valid as long as the packet is valid (which is only valid until the next call to readPacket).
+
 ## lastReadPacket() []const u8
 Returns the full raw packet from the last call to `readPacket`. Might be useful when debugging.

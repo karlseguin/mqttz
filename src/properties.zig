@@ -203,7 +203,7 @@ fn writeLen(value: anytype, comptime properties: []const PropertyType) usize {
 
 pub const Reader = struct {
 	len: usize,
-	buf: []u8,
+	buf: []const u8,
 
 	const Value = struct {
 		type: u8,
@@ -234,20 +234,46 @@ pub const Reader = struct {
 		// all legal values are < 128 (hence, 1 byte).
 
 		const property_type = buf[0];
-		inline for (@typeInfo(Property).Union.fields) |field| {
-			if (property_type == @intFromEnum(@field(PropertyType, field.name))) {
-				const value, const len = try readValue(field.type, buf[1..]);
+		if (property_type == 38) {
+			// special handling for user_properties
+			// See Iterator documentation
 
-				// + 1 for the property type
-				self.buf = buf[1 + len..];
-				return @unionInit(Property, field.name, value);
+			if (buf.len < 5) {
+				// 2 for the key length
+				// 2 fo the value length
+				// 1 for the property_type (which we already know is there)
+				return error.InvalidPropertyValue;
+			}
+
+			const key_len = codec.readInt(u16, buf[1..3]);
+			// 1 for the propety_type
+			// 2 for key length (like the 2 bytes of the length itself)
+			const val_len_offset = 3 + key_len;
+			const val_len_end = val_len_offset + 2;
+			if (buf.len < val_len_end) {
+				return error.InvalidPropertyValue;
+			}
+			const val_len = codec.readInt(u16, buf[val_len_offset..val_len_end][0..2]);
+
+			const property_end = val_len_end + val_len;
+			self.buf = buf[property_end..];
+			return .{.user_properties = buf};
+		} else {
+			inline for (@typeInfo(Property).Union.fields) |field| {
+				if (property_type == @intFromEnum(@field(PropertyType, field.name))) {
+					const value, const len = try readValue(field.type, buf[1..]);
+
+					// + 1 for the property type
+					self.buf = buf[1 + len..];
+					return @unionInit(Property, field.name, value);
+				}
 			}
 		}
 		return error.UnknownProperty;
 	}
 };
 
-fn readValue(comptime T: type, buf: []u8) !struct{T, usize} {
+fn readValue(comptime T: type, buf: []const u8) !struct{T, usize} {
 	switch (T) {
 		bool => {
 			if (buf.len == 0 or buf[0] > 1) {
@@ -292,6 +318,70 @@ fn readValue(comptime T: type, buf: []u8) !struct{T, usize} {
 		else => unreachable,
 	}
 }
+
+// I need to write this down, 'cuz if I come back to this in a month (or even
+// tomorrow), I'll be confused.
+// The User Property property is special because it can appear more than once
+// AND, as far as I can tell, they don't need to be grouped together
+// The easy way to handle it would be to ignore it.
+// The next easiest way to handle it would be to allocate an array to hold
+// the values as we iterate through it in Reader.next(). But we don't want to
+// allocate, especially for something most people won't care about.
+// Instead, this iterator is like Reader (it wraps reader in fact) but where
+// reader treats User Properties as a blob that largely gets skipped over, this
+// skips over every other field and only handles User Properties.
+// As an optimization, the first User Property we see when doing Reader.next
+// because, from the point of view of this iterator, the beginning of our
+// property list.
+
+// For example, imagine we have this property list:
+//
+// 31, 0, 2, 'n', 'o',             <- reason string: "no"
+// 38, 0, 1, 'a', 0, 1, 'b',       <- user property a=1
+// 1, 1,                           <- property format: 1
+// 38, 0, 2, 'a', 'b' 0, 1, 'z'    <- user property ab=z
+//
+// When iterating through Reader.next(), on the first user property, we'll
+// store a slice of our buffer starting from that property, so it'll look like:
+//
+// 38, 0, 1, 'a', 0, 1, 'b',       <- user property a=1
+// 1, 1,                           <- property format: 1
+// 38, 0, 2, 'a', 'b' 0, 1, 'z'    <- user property ab=z
+//
+// Now when we iterate through this slice, using the same Reader, we at least
+// don't have to process any of the properties that can before our first user
+// property.
+// skipped every
+
+pub const UserPropertyIterator = struct {
+	reader: Reader,
+
+	pub fn init(buf: []const u8) UserPropertyIterator {
+		return .{
+			.reader = .{.buf = buf, .len = buf.len},
+		};
+	}
+
+	pub fn next(self: *UserPropertyIterator) ?mqtt.UserProperty {
+		while (true) {
+			const property = (self.reader.next() catch return null) orelse return null;
+			if (property != .user_properties) {
+				continue;
+			}
+			const raw = property.user_properties;
+			if (raw.len < 1) {
+				// weird.
+				return null;
+			}
+			const key, const key_len = codec.readString(raw[1..]) catch return null;
+			const value, _ = codec.readString(raw[key_len+1..]) catch return null;
+			return .{
+				.key = key,
+				.value = value,
+			};
+		}
+	}
+};
 
 const t  = @import("std").testing;
 test "properties: write" {
