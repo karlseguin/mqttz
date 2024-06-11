@@ -166,7 +166,7 @@ This can be called internally, via `disconnect`, by the library as required by t
 ## Errors
 `Mqtt(T)` methods return errors which are meant to be easy(ish) to manage. The `last_error` field is an optional tagged union that can include additional information. The ideas is to provide a manageable number of error values without sacrificing additional details (which might traditionally be handled by having a much larger error set, which is harder to handle).
 
-For example, the only errors `subscribe` can return are: `error.Usage`, `error.WriteBufferIsFull` or `error.Write`. If an error is returned, in most cases the optional `last_error` field will be set. Above, we saw that `T.write(...) !void` can return any error. If `T.write` does return an error, `subscribe` will map this to `error.Write` and set `last_error.?.inner` to the actual error returned by `T.write`.
+For example, the only errors `subscribe` can return are: `error.Usage`, `error.WriteBufferIsFull` or any error your `T.write` method returns. If an error is returned, in most cases the optional `last_error` field will be set. 
 
 # Mqtt(T)
 As a consequence of being a foundation, `Mqtt(T)` has a simple interface.
@@ -185,7 +185,7 @@ None of the `opts` field are required.
 
 Will call T.write(state, data) exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`.
+Possible errors are: `error.WriteBufferIsFull`, any error returned from your `T.write`.
 
 ## subscribe(state: anytype, opts: SubscribeOpts) !usize
 `opts` must include at least 1 topic which must contain a filter:
@@ -200,7 +200,7 @@ mqtt.subscribe(&ctx, .{
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`, `error.Usage`. `error.Usage` happens if no topic is provided.
+Possible errors are: `error.WriteBufferIsFull`, `error.Usage`, any error returned from your `T.write`. `error.Usage` happens if no topic is provided.
 
 Returns the `packet_identifier`. The `packet_identifier` can be set explicitly via the `packet_identifier: ?u16 = null` field of the `SubscribeOpts`. Otherwise, an incrementing integer is used. The `packet_identifier` is used to pair the `subscribe` with corresponding `suback` which can be retrieved via `readPacket()`.
 
@@ -215,7 +215,7 @@ mqtt.unsubscribe(&ctx, .{
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`, `error.Usage`. `error.Usage` happens if no topic is provided.
+Possible errors are: `error.WriteBufferIsFull`, `error.Usage` any error returned from your `T.write`. `error.Usage` happens if no topic is provided.
 
 Returns the `packet_identifier`. The `packet_identifier` can be set explicitly via the `packet_identifier: ?u16 = null` field of the `UnsubscribeOpts`. Otherwise, an incrementing integer is used. The `packet_identifier` is used to pair the `unsubscribe` with corresponding `unsuback` which can be retrieved via `readPacket()`.
 
@@ -231,7 +231,7 @@ mqtt.public(&ctx, .{
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`, `error.Usage`. `error.Usage` happens if the `retain` flag is set, but the server announced (via the `connack` message) that it did not support retained messages.
+Possible errors are: `error.WriteBufferIsFull`, `error.Usage` any error returned from your `T.write`. `error.Usage` happens if the `retain` flag is set, but the server announced (via the `connack` message) that it did not support retained messages.
 
 Returns the `packet_identifier`. The `packet_identifier` can be set explicitly via the `packet_identifier: ?u16 = null` field of the `PublishOpts`. Otherwise, an incrementing integer is used. The `packet_identifier` is used to pair the `publish` with corresponding `pubrec` or `pubrel` assuming the `qos` option is set.
 
@@ -240,28 +240,28 @@ Returns the `packet_identifier`. The `packet_identifier` can be set explicitly v
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`.
+Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.write`.
 
 ## pubrec(state: anytype, opts: PubRecOpts) !void
 `opts` must include the `packet_identifer` of the `publish` this message is in response to.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`.
+Possible errors are: `error.WriteBufferIsFull`, any error returned from your `T.write`.
 
 ## pubrel(state: anytype, opts: PubRelOpts) !void
 `opts` must include the `packet_identifer` of the `publish` this message is in response to.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`.
+Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.write`.
 
 ## pubcomp(state: anytype, opts: PubCompOpts) !void
 `opts` must include the `packet_identifer` of the `publish` this message is in response to.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Write`.
+Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.write`.
 
 ## disconnect(state: anytype. opts: DisconnectOpts) !void
 `opts` must include the `reason` for the disconnect. This is an enum.
@@ -285,12 +285,12 @@ Possible errors are: `error.WriteBufferIsFull`, `error.Write`.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.Write`.
+Possible errors are: any error returned from your `T.write`.
 
 ## ping(state: anytype) !void
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.Write`.
+Possible errors are: any error returned from your `T.write`.
 
 ## readPacket(state: anytype) !void
 Attempts to read a packet from the server.
@@ -298,11 +298,12 @@ Attempts to read a packet from the server.
 This may call `T.read(state, buf, calls)` 0 or more times. It will call it 0 times if there is already a packet in `read_buf` (from a previous call to `T.read` which read more than 1 packet). `calls` is the number of times (starting at 1) that `T.read` has been called in this single invocation of `readPacket`. This could be used, for example, to control a timeout (in most cases, you'll probably just ignore `calls`).
 
 Possible errors are: 
-- `error.Read` - `T.read` returned an error (see `last_error.?.inner` for the actual error it returned)
 - `error.Closed` - `T.read` returned 0
 - `error.ReadBufferIsFull` - The packet was too large to fit in `read_buf`
 - `error.Protocol` - A valid packet was received but, from this libraries point of view, the packet didn't make sense. For example, the packet might have had a `reason_code` which was not valid (not one of the allowed u8 values). If you're using a robust server implementation, this is likely a bug/oversight in this library
 - `error.MalformedPacket` - An invalid packet was received which could not be parsed. If you're using a robust server implementation, this is likely a bug/oversight in this library.
+
+Plus any error returned by your `T.read`.
 
 On success, `readPacket` returns a tagged union. This union has the following tags:
 
@@ -363,3 +364,6 @@ The key and value are only valid as long as the packet is valid (which is only v
 
 ## lastReadPacket() []const u8
 Returns the full raw packet from the last call to `readPacket`. Might be useful when debugging.
+
+## Timeouts
+Because the error you returned from `T.read` is returned back to your code, you can implement a timeout in `T.read`, return an error, say `error.Timeout`  and then catch/handle that in your call to `readPacket`. It is ok to return such an error, even when `calls > 1` and then to continue with another `readPacket` at some point in the future. Any partial data in the `read_buf` will persist.

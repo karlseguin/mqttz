@@ -260,12 +260,14 @@ pub fn Mqtt(comptime T: type) type {
 			return self.read_buf[0..self.read_pos];
 		}
 
-		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) error{WriteBufferIsFull, Write}!void {
+		const WriteError = @typeInfo(@typeInfo(@TypeOf(T.write)).Fn.return_type.?).ErrorUnion.error_set;
+
+		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) (WriteError || error{WriteBufferIsFull})!void {
 			const connect_packet = try encodeConnect(self.write_buf, opts);
 			try self.writePacket(state, connect_packet);
 		}
 
-		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) error{Usage, WriteBufferIsFull, Write}!usize {
+		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) (WriteError || error{Usage, WriteBufferIsFull})!usize {
 			if (opts.topics.len == 0) {
 				self.last_error = .{.details = "must have at least 1 topic"};
 				return error.Usage;
@@ -277,7 +279,7 @@ pub fn Mqtt(comptime T: type) type {
 			return packet_identifier;
 		}
 
-		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) error{Usage, WriteBufferIsFull, Write}!usize {
+		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) (WriteError || error{Usage, WriteBufferIsFull})!usize {
 			if (opts.topics.len == 0) {
 				self.last_error = .{.details = "must have at least 1 topic"};
 				return error.Usage;
@@ -289,7 +291,7 @@ pub fn Mqtt(comptime T: type) type {
 			return packet_identifier;
 		}
 
-		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) error{Usage, WriteBufferIsFull, Write}!usize {
+		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) (WriteError || error{Usage, WriteBufferIsFull})!usize {
 			if (opts.retain == true and self.server_can_retain == false) {
 				self.last_error = .{.details = "server does not support retained messages"};
 				return error.Usage;
@@ -304,33 +306,33 @@ pub fn Mqtt(comptime T: type) type {
 			return packet_identifier;
 		}
 
-		pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) error{WriteBufferIsFull, Write}!void {
+		pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) (WriteError || error{WriteBufferIsFull})!void {
 			const puback_packet = try encodePubAck(self.write_buf, opts);
 			try self.writePacket(state, puback_packet);
 		}
 
-		pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) error{WriteBufferIsFull, Write}!void {
+		pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) (WriteError || error{WriteBufferIsFull})!void {
 			const pubrec_packet = try encodePubRec(self.write_buf, opts);
 			try self.writePacket(state, pubrec_packet);
 		}
 
-		pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) error{WriteBufferIsFull, Write}!void {
+		pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) (WriteError || error{WriteBufferIsFull})!void {
 			const pubrel_packet = try encodePubRel(self.write_buf, opts);
 			try self.writePacket(state, pubrel_packet);
 		}
 
-		pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) error{WriteBufferIsFull, Write}!void {
+		pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) (WriteError || error{WriteBufferIsFull})!void {
 			const pubcomp_packet = try encodePubComp(self.write_buf, opts);
 			try self.writePacket(state, pubcomp_packet);
 		}
 
-		pub fn ping(self: *Self, state: anytype) error{Write}!void {
+		pub fn ping(self: *Self, state: anytype) WriteError!void {
 			// 1100 000  (packet type + flags)
 			// 0         (varing payload length)
 			try self.writePacket(state, &.{192, 0});
 		}
 
-		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) error{WriteBufferIsFull, Write}!void {
+		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull})!void {
 			defer T.close(state);
 			const disconnect_packet = try encodeDisconnect(self.write_buf, opts);
 			return self.writePacket(state, disconnect_packet);
@@ -345,20 +347,17 @@ pub fn Mqtt(comptime T: type) type {
 			return pi;
 		}
 
-		fn writePacket(self: *Self, state: anytype, data: []const u8) error{Write}!void {
-			return T.write(state, data) catch |err| {
-				self.last_error = .{.inner = err};
-				return error.Write;
-			};
+		fn writePacket(_: *Self, state: anytype, data: []const u8) WriteError!void {
+			return T.write(state, data);
 		}
 
 		const ReadError = error {
-			Read,
 			Closed,
 			ReadBufferIsFull,
 			Protocol,
 			MalformedPacket,
-		};
+		} || @typeInfo(@typeInfo(@TypeOf(T.read)).Fn.return_type.?).ErrorUnion.error_set;
+
 		pub fn readPacket(self: *Self, state: anytype) ReadError!Packet {
 			const p = try self.readOrBuffered(state);
 			switch (p) {
@@ -408,11 +407,7 @@ pub fn Mqtt(comptime T: type) type {
 					self.read_len = pos;
 				}
 
-				const n = T.read(state, buf[pos..], calls) catch |err| {
-					self.last_error = .{.inner = err};
-					return error.Read;
-				};
-
+				const n = try T.read(state, buf[pos..], calls);
 				if (n == 0) {
 					return error.Closed;
 				}
