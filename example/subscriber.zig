@@ -154,23 +154,25 @@ const Client = struct {
 		}
 	}
 
-	// We must provide a read function
-	pub fn read(self: *Client, buf: []u8, _: usize) !usize {
-		return std.posix.read(self.socket, buf);
-	}
-
-	// We must provide a write function
-	pub fn write(self: *Client, data: []const u8) !void {
-		var pos: usize = 0;
-		const socket = self.socket;
-		while (pos < data.len) {
-			pos += try std.posix.write(socket, data[pos..]);
+	pub const MqttPlatform = struct {
+		// We must provide a read function
+		pub fn read(self: *Client, buf: []u8, _: usize) !usize {
+			return std.posix.read(self.socket, buf);
 		}
-	}
 
-	// We must provide a close function
-	pub fn close(self: *Client) void {
-		std.posix.close(self.socket);
-	}
+		// We must provide a write function
+		pub fn write(self: *Client, data: []const u8) !void {
+			var pos: usize = 0;
+			const socket = self.socket;
+			while (pos < data.len) {
+				pos += try std.posix.write(socket, data[pos..]);
+			}
+		}
+
+		// We must provide a close function
+		pub fn close(self: *Client) void {
+			std.posix.close(self.socket);
+		}
+	};
 };
 

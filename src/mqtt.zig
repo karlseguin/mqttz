@@ -260,10 +260,10 @@ pub fn Mqtt(comptime T: type) type {
 			return self.read_buf[0..self.read_pos];
 		}
 
-		const WriteError = @typeInfo(@typeInfo(@TypeOf(T.write)).Fn.return_type.?).ErrorUnion.error_set;
+		const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).Fn.return_type.?).ErrorUnion.error_set;
 
 		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) (WriteError || error{WriteBufferIsFull})!void {
-			const connect_packet = try encodeConnect(self.write_buf, opts);
+			const connect_packet = try codec.encodeConnect(self.write_buf, opts);
 			try self.writePacket(state, connect_packet);
 		}
 
@@ -274,7 +274,7 @@ pub fn Mqtt(comptime T: type) type {
 			}
 
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-			const subscribe_packet = try encodeSubscribe(self.write_buf, packet_identifier, opts);
+			const subscribe_packet = try codec.encodeSubscribe(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, subscribe_packet);
 			return packet_identifier;
 		}
@@ -286,7 +286,7 @@ pub fn Mqtt(comptime T: type) type {
 			}
 
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-			const unsubscribe_packet = try encodeUnsubscribe(self.write_buf, packet_identifier, opts);
+			const unsubscribe_packet = try codec.encodeUnsubscribe(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, unsubscribe_packet);
 			return packet_identifier;
 		}
@@ -301,28 +301,28 @@ pub fn Mqtt(comptime T: type) type {
 				return error.Usage;
 			}
 			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-			const publish_packet = try encodePublish(self.write_buf, packet_identifier, opts);
+			const publish_packet = try codec.encodePublish(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, publish_packet);
 			return packet_identifier;
 		}
 
 		pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) (WriteError || error{WriteBufferIsFull})!void {
-			const puback_packet = try encodePubAck(self.write_buf, opts);
+			const puback_packet = try codec.encodePubAck(self.write_buf, opts);
 			try self.writePacket(state, puback_packet);
 		}
 
 		pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) (WriteError || error{WriteBufferIsFull})!void {
-			const pubrec_packet = try encodePubRec(self.write_buf, opts);
+			const pubrec_packet = try codec.encodePubRec(self.write_buf, opts);
 			try self.writePacket(state, pubrec_packet);
 		}
 
 		pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) (WriteError || error{WriteBufferIsFull})!void {
-			const pubrel_packet = try encodePubRel(self.write_buf, opts);
+			const pubrel_packet = try codec.encodePubRel(self.write_buf, opts);
 			try self.writePacket(state, pubrel_packet);
 		}
 
 		pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) (WriteError || error{WriteBufferIsFull})!void {
-			const pubcomp_packet = try encodePubComp(self.write_buf, opts);
+			const pubcomp_packet = try codec.encodePubComp(self.write_buf, opts);
 			try self.writePacket(state, pubcomp_packet);
 		}
 
@@ -333,8 +333,8 @@ pub fn Mqtt(comptime T: type) type {
 		}
 
 		pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull})!void {
-			defer T.close(state);
-			const disconnect_packet = try encodeDisconnect(self.write_buf, opts);
+			defer T.MqttPlatform.close(state);
+			const disconnect_packet = try codec.encodeDisconnect(self.write_buf, opts);
 			return self.writePacket(state, disconnect_packet);
 		}
 
@@ -348,7 +348,7 @@ pub fn Mqtt(comptime T: type) type {
 		}
 
 		fn writePacket(_: *Self, state: anytype, data: []const u8) WriteError!void {
-			return T.write(state, data);
+			return T.MqttPlatform.write(state, data);
 		}
 
 		const ReadError = error {
@@ -356,10 +356,10 @@ pub fn Mqtt(comptime T: type) type {
 			ReadBufferIsFull,
 			Protocol,
 			MalformedPacket,
-		} || @typeInfo(@typeInfo(@TypeOf(T.read)).Fn.return_type.?).ErrorUnion.error_set;
+		} || @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.read)).Fn.return_type.?).ErrorUnion.error_set;
 
-		pub fn readPacket(self: *Self, state: anytype) ReadError!Packet {
-			const p = try self.readOrBuffered(state);
+		pub fn readPacket(self: *Self, state: anytype) ReadError!?Packet {
+			const p = (try self.readOrBuffered(state)) orelse return null;
 			switch (p) {
 				.connack => |*connack| try self.processConnack(state, connack),
 				else => {}
@@ -367,7 +367,7 @@ pub fn Mqtt(comptime T: type) type {
 			return p;
 		}
 
-		fn readOrBuffered(self: *Self, state: anytype) !Packet {
+		fn readOrBuffered(self: *Self, state: anytype) !?Packet {
 			if (try self.bufferedPacket()) |p| {
 				return p;
 			}
@@ -407,7 +407,7 @@ pub fn Mqtt(comptime T: type) type {
 					self.read_len = pos;
 				}
 
-				const n = try T.read(state, buf[pos..], calls);
+				const n = (try T.MqttPlatform.read(state, buf[pos..], calls)) orelse return null;
 				if (n == 0) {
 					return error.Closed;
 				}
@@ -451,7 +451,7 @@ pub fn Mqtt(comptime T: type) type {
 			}
 
 			self.read_pos += total_len;
-			return decodePacket(buf[0], buf[fixed_header_len..total_len]) catch |err| {
+			return Packet.decode(buf[0], buf[fixed_header_len..total_len]) catch |err| {
 				self.last_error = .{.inner = err};
 				switch (err) {
 					error.UnknownPacketType => return error.Protocol,
@@ -484,253 +484,6 @@ pub fn Mqtt(comptime T: type) type {
 	};
 }
 
-const PublishFlags = packed struct(u4) {
-	dup: bool,
-	qos: QoS,
-	retain: bool,
-};
-
-fn encodeConnect(buf: []u8, opts: ConnectOpts) ![]u8 {
-	var connect_flags = packed struct(u8) {
-		_reserved: bool = false,
-		clean_start: bool = true,
-		will: bool = false,
-		will_qos: QoS = .at_most_once,
-		will_retain: bool = false,
-		username: bool,
-		password: bool,
-	}{
-		.username = opts.username != null,
-		.password = opts.password != null,
-	};
-
-	if (opts.will) |w| {
-		connect_flags.will = true;
-		connect_flags.will_qos = w.qos;
-		connect_flags.will_retain = w.retain;
-	}
-
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	buf[5] = 0;
-	buf[6] = 4;  // length of string, 4: MQTT
-	buf[7] = 'M';
-	buf[8] = 'Q';
-	buf[9] = 'T';
-	buf[10] = 'T';
-
-	buf[11] = 5; // protocol
-
-	buf[12] = @as([*]u8, @ptrCast(@alignCast(&connect_flags)))[0];
-
-	codec.writeInt(u16, buf[13..15], opts.keepalive_sec);
-
-	// everything above is safe, since buf is at least MIN_BUF_SIZE.
-
-	const PROPERTIES_OFFSET = 15;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.CONNECT);
-
-	// Start payload
-	var pos = PROPERTIES_OFFSET + properties_len;
-	pos += try codec.writeString(buf[pos..], opts.client_id orelse "");
-
-	if (opts.will) |will| {
-		pos += try properties.write(buf[pos..], will, &properties.WILL);
-	}
-
-	if (opts.username) |u| {
-		pos += try codec.writeString(buf[pos..], u);
-	}
-
-	if (opts.password) |p| {
-		pos += try codec.writeString(buf[pos..], p);
-	}
-	return encodePacketHeader(buf[0..pos], 1, 0);
-}
-
-fn encodeDisconnect(buf: []u8, opts: DisconnectOpts) ![]u8 {
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	buf[5] = @intFromEnum(opts.reason);
-	const PROPERTIES_OFFSET = 6;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.DISCONNECT);
-
-	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 14, 0);
-}
-
-fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: SubscribeOpts) ![]u8 {
-	const SubscriptionOptions = packed struct(u8) {
-		qos: QoS,
-		no_local: bool,
-		retain_as_published: bool,
-		retain_handling: RetainHandling,
-		_reserved: u2 = 0,
-	};
-
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-
-	codec.writeInt(u16, buf[5..7], packet_identifier);
-	const PROPERTIES_OFFSET = 7;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.SUBSCRIBE);
-
-	var pos = PROPERTIES_OFFSET + properties_len;
-	for (opts.topics) |topic| {
-		pos += try codec.writeString(buf[pos..], topic.filter);
-		var subscription_options = SubscriptionOptions{
-			.qos = topic.qos,
-			.no_local = topic.no_local,
-			.retain_as_published = topic.retain_as_published,
-			.retain_handling = topic.retain_handling,
-		};
-		buf[pos] = @as([*]u8, @ptrCast(@alignCast(&subscription_options)))[0];
-		pos += 1;
-	}
-
-	return encodePacketHeader(buf[0..pos], 8, 2);
-}
-
-fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: UnsubscribeOpts) ![]u8 {
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	codec.writeInt(u16, buf[5..7], packet_identifier);
-	const PROPERTIES_OFFSET = 7;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.UNSUBSCRIBE);
-
-	var pos = PROPERTIES_OFFSET + properties_len;
-	for (opts.topics) |topic| {
-		pos += try codec.writeString(buf[pos..], topic);
-	}
-
-	return encodePacketHeader(buf[0..pos], 10, 2);
-}
-
-fn encodePublish(buf: []u8, packet_identifier: u16, opts: PublishOpts) ![]u8 {
-	var publish_flags = PublishFlags{
-		.dup = opts.dup,
-		.qos = opts.qos,
-		.retain = opts.retain,
-	};
-
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	const VARIABLE_HEADER_OFFSET = 5;
-	const topic_len = try codec.writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
-
-
-	var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
-	if (opts.qos != .at_most_once) {
-		// when QoS > 0, we include a packet identifier
-		const packet_identifier_offset = properties_offset;
-		properties_offset += 2;
-		codec.writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], packet_identifier);
-	}
-
-	const properties_len = try properties.write(buf[properties_offset..], opts, &properties.PUBLISH);
-
-	const payload_offset = properties_offset + properties_len;
-	const message = opts.message;
-	const end = payload_offset + message.len;
-	if (end > buf.len) {
-		return error.WriteBufferIsFull;
-	}
-	@memcpy(buf[payload_offset..end], message);
-	return encodePacketHeader(buf[0..end], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
-}
-
-fn encodePubAck(buf: []u8, opts: PubAckOpts) ![]u8 {
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
-	buf[7] = @intFromEnum(opts.reason_code);
-	const PROPERTIES_OFFSET = 8;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBACK);
-
-	if (opts.reason_code == .success and properties_len == 1) {
-		// special case, if the reason code is 0 and ther are no properties
-		// we can ommit both, and thus we only have a packet with
-		// type+flag, length (of 2), 2 byte packet_identifier
-		buf[3] = 64; // packet type (0100) + flags (0000)
-		buf[4] = 2;  // remaining length
-		return buf[3..7];
-	}
-
-	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 4, 0);
-}
-
-fn encodePubRec(buf: []u8, opts: PubRecOpts) ![]u8 {
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
-	buf[7] = @intFromEnum(opts.reason_code);
-	const PROPERTIES_OFFSET = 8;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREC);
-
-	if (opts.reason_code == .success and properties_len == 1) {
-		// special case, if the reason code is 0 and ther are no properties
-		// we can ommit both, and thus we only have a packet with
-		// type+flag, length (of 2), 2 byte packet_identifier
-		buf[3] = 80; // packet type (0101) + flags (0000)
-		buf[4] = 2;  // remaining length
-		return buf[3..7];
-	}
-
-	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 5, 0);
-}
-
-fn encodePubRel(buf: []u8, opts: PubRelOpts) ![]u8 {
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
-	buf[7] = @intFromEnum(opts.reason_code);
-	const PROPERTIES_OFFSET = 8;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREL);
-
-	if (opts.reason_code == .success and properties_len == 1) {
-		// special case, if the reason code is 0 and ther are no properties
-		// we can ommit both, and thus we only have a packet with
-		// type+flag, length (of 2), 2 byte packet_identifier
-		buf[3] = 98; // packet type (0101) + flags (0010)
-		buf[4] = 2;  // remaining length
-		return buf[3..7];
-	}
-
-	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 6, 2);
-}
-
-fn encodePubComp(buf: []u8, opts: PubCompOpts) ![]u8 {
-	// reserve 1 byte for the packet type
-	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
-	codec.writeInt(u16,  buf[5..7], opts.packet_identifier);
-	buf[7] = @intFromEnum(opts.reason_code);
-	const PROPERTIES_OFFSET = 8;
-	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBCOMP);
-
-	if (opts.reason_code == .success and properties_len == 1) {
-		// special case, if the reason code is 0 and ther are no properties
-		// we can ommit both, and thus we only have a packet with
-		// type+flag, length (of 2), 2 byte packet_identifier
-		buf[3] = 112; // packet type (0111) + flags (0000)
-		buf[4] = 2;  // remaining length
-		return buf[3..7];
-	}
-
-	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 7, 0);
-}
-
-fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
-	const remaining_len = buf.len - 5;
-	const length_of_len = codec.lengthOfVarint(remaining_len);
-
-	// This is where, in buf, our packet is actually going to start. You'd think
-	// it would start at buf[0], but the package length is variable, so it'll
-	// only start at buf[0] in the [unlikely] case where the length took 4 bytes.
-	const start = 5 - length_of_len - 1;
-
-	buf[start] = (packet_type << 4) | packet_flags;
-	_ = codec.writeVarint(buf[start+1..], remaining_len);
-	return buf[start..];
-}
 
 // These are only the packets that a client can receive
 // For packets that the client sends, we write the Opts (e.g. ConnectionOpts)
@@ -991,26 +744,26 @@ pub const Packet = union(enum) {
 			wildcard_subscriptions_not_supported = 162,
 		};
 	};
-};
 
-fn decodePacket(b1: u8, data: []u8) !Packet {
-	// data.len has to be > 0
-	// TODO: how to assert without std?
-	const flags: u4 = @intCast(b1 & 15);
-	switch (b1 >> 4) {
-		2 => return .{.connack = try decodeConnAck(data, flags)},
-		3 => return .{.publish = try decodePublish(data, flags)},
-		4 => return .{.puback = try decodePubAck(data, flags)},
-		5 => return .{.pubrec = try decodePubRec(data, flags)},
-		6 => return .{.pubrel = try decodePubRel(data, flags)},
-		7 => return .{.pubcomp = try decodePubComp(data, flags)},
-		9 => return .{.suback = try decodeSubAck(data, flags)},
-		11 => return .{.unsuback = try decodeUnsubAck(data, flags)},
-		13 => return if (flags == 0) .{.pong = {}} else error.InvalidFlags,
-		14 => return .{.disconnect = try decodeDisconnect(data, flags)},
-		else => return error.UnknownPacketType, // TODO
+	pub fn decode(b1: u8, data: []u8) !Packet {
+		// data.len has to be > 0
+		// TODO: how to assert without std?
+		const flags: u4 = @intCast(b1 & 15);
+		switch (b1 >> 4) {
+			2 => return .{.connack = try decodeConnAck(data, flags)},
+			3 => return .{.publish = try decodePublish(data, flags)},
+			4 => return .{.puback = try decodePubAck(data, flags)},
+			5 => return .{.pubrec = try decodePubRec(data, flags)},
+			6 => return .{.pubrel = try decodePubRel(data, flags)},
+			7 => return .{.pubcomp = try decodePubComp(data, flags)},
+			9 => return .{.suback = try decodeSubAck(data, flags)},
+			11 => return .{.unsuback = try decodeUnsubAck(data, flags)},
+			13 => return if (flags == 0) .{.pong = {}} else error.InvalidFlags,
+			14 => return .{.disconnect = try decodeDisconnect(data, flags)},
+			else => return error.UnknownPacketType, // TODO
+		}
 	}
-}
+};
 
  fn decodeConnAck(data: []u8, flags: u4) !Packet.ConnAck {
 	if (flags != 0) {
@@ -1177,7 +930,7 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
 		return error.IncompletePacket;
 	}
 
-	const publish_flags: *PublishFlags = @constCast(@ptrCast(&flags));
+	const publish_flags: *codec.PublishFlags = @constCast(@ptrCast(&flags));
 
 	const topic, var properties_offset = try codec.readString(data);
 	var publish = Packet.Publish{
@@ -1988,14 +1741,14 @@ test "Client: readPacket fuzz" {
 		});
 
 		var client = &ctx.client;
-		const connack = (try client.readPacket(&ctx)).connack;
+		const connack = (try client.readPacket(&ctx)).?.connack;
 		try t.expectEqualSlices(u8, "none", connack.authentication_method.?);
 
-		const suback1 = (try client.readPacket(&ctx)).suback;
+		const suback1 = (try client.readPacket(&ctx)).?.suback;
 		try t.expectEqual(259, suback1.packet_identifier);
 		try t.expectEqualSlices(u8, &.{0, 1}, suback1.results);
 
-		const suback2 = (try client.readPacket(&ctx)).suback;
+		const suback2 = (try client.readPacket(&ctx)).?.suback;
 		try t.expectEqual(2, suback2.packet_identifier);
 		try t.expectEqualSlices(u8, &([_]u8{0} ** 249), suback2.results);
 	}
@@ -2011,7 +1764,7 @@ test "Client: readPacket connack" {
 		// return with error reason code
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 133, 0});
-		const connack = (try client.readPacket(&ctx)).connack;
+		const connack = (try client.readPacket(&ctx)).?.connack;
 		try t.expectEqual(.client_identifier_not_valid, connack.reason_code);
 	}
 
@@ -2040,7 +1793,7 @@ test "Client: readPacket connack" {
 		ctx.reset();
 		ctx.reply(&.{32, 3, 0, 0, 0});
 
-		const connack = (try client.readPacket(&ctx)).connack;
+		const connack = (try client.readPacket(&ctx)).?.connack;
 
 		// the default if the server doesn't send up a retain_available property
 		try t.expectEqual(true, client.server_can_retain);
@@ -2074,7 +1827,7 @@ test "Client: readPacket connack" {
 		ctx.reset();
 		ctx.reply(&.{32, 8, 0, 0, 5, 19, 0, 60, 37, 0});
 
-		const connack = (try client.readPacket(&ctx)).connack;
+		const connack = (try client.readPacket(&ctx)).?.connack;
 
 		// server told us it won't/can't retain
 		try t.expectEqual(false, client.server_can_retain);
@@ -2136,7 +1889,7 @@ test "Client: readPacket suback" {
 		// basic response
 		ctx.reset();
 		ctx.reply(&.{144, 4, 1, 2, 0, 1});
-		const suback = (try client.readPacket(&ctx)).suback;
+		const suback = (try client.readPacket(&ctx)).?.suback;
 		try t.expectEqual(258, suback.packet_identifier);
 		try t.expectEqual(null, suback.reason_string);
 		try t.expectEqualSlices(u8, &.{1}, suback.results);
@@ -2154,7 +1907,7 @@ test "Client: readPacket suback" {
 			31, 0, 2, 'o', 'k',  // reason
 			2, 135, 4,   // 3 reasons
 		});
-		const suback = (try client.readPacket(&ctx)).suback;
+		const suback = (try client.readPacket(&ctx)).?.suback;
 		try t.expectEqual(1, suback.packet_identifier);
 		try t.expectEqualSlices(u8, "ok", suback.reason_string.?);
 		try t.expectEqualSlices(u8, &.{2, 135, 4}, suback.results);
@@ -2190,7 +1943,7 @@ test "Client: readPacket unsuback" {
 		// basic response
 		ctx.reset();
 		ctx.reply(&.{176, 4, 2, 2, 0, 0});
-		const unsuback = (try client.readPacket(&ctx)).unsuback;
+		const unsuback = (try client.readPacket(&ctx)).?.unsuback;
 		try t.expectEqual(514, unsuback.packet_identifier);
 		try t.expectEqual(null, unsuback.reason_string);
 		try t.expectEqualSlices(u8, &.{0}, unsuback.results);
@@ -2208,7 +1961,7 @@ test "Client: readPacket unsuback" {
 			31, 0, 2, 'o', 'k',  // reason
 			2, 135, 17,   // 3 reasons
 		});
-		const unsuback = (try client.readPacket(&ctx)).unsuback;
+		const unsuback = (try client.readPacket(&ctx)).?.unsuback;
 		try t.expectEqual(1, unsuback.packet_identifier);
 		try t.expectEqualSlices(u8, "ok", unsuback.reason_string.?);
 		try t.expectEqualSlices(u8, &.{2, 135, 17}, unsuback.results);
@@ -2242,7 +1995,7 @@ test "Client: readPacket publish" {
 			0,                        // property list length
 			'h', 'e', 'l', 'l', 'o'   // payload (message)
 		});
-		const publish = (try client.readPacket(&ctx)).publish;
+		const publish = (try client.readPacket(&ctx)).?.publish;
 		try t.expectEqual(.at_most_once, publish.qos);
 		try t.expectEqual(false, publish.dup);
 		try t.expectEqual(false, publish.retain);
@@ -2270,7 +2023,7 @@ test "Client: readPacket publish" {
 			0,                        // property list length
 			'h', 'e', 'l', 'l', 'o'  // payload (message)
 		});
-		const publish = (try client.readPacket(&ctx)).publish;
+		const publish = (try client.readPacket(&ctx)).?.publish;
 		try t.expectEqual(.at_least_once, publish.qos);
 		try t.expectEqual(false, publish.dup);
 		try t.expectEqual(false, publish.retain);
@@ -2310,7 +2063,7 @@ test "Client: readPacket puback" {
 			2,
 			10, 2,                    // packet identifier
 		});
-		const puback = (try client.readPacket(&ctx)).puback;
+		const puback = (try client.readPacket(&ctx)).?.puback;
 		try t.expectEqual(2562, puback.packet_identifier);
 		try t.expectEqual(.success, puback.reason_code);
 		try t.expectEqual(null, puback.reason_string);
@@ -2327,7 +2080,7 @@ test "Client: readPacket puback" {
 			7,                       // properties length
 			31, 0, 4, 'n', 'o', 'p', 'e'
 		});
-		const puback = (try client.readPacket(&ctx)).puback;
+		const puback = (try client.readPacket(&ctx)).?.puback;
 		try t.expectEqual(3, puback.packet_identifier);
 		try t.expectEqual(.not_authorized, puback.reason_code);
 		try t.expectEqualSlices(u8, "nope", puback.reason_string.?);
@@ -2356,7 +2109,7 @@ test "Client: readPacket pubrec" {
 			2,
 			10, 2,                    // packet identifier
 		});
-		const pubrec = (try client.readPacket(&ctx)).pubrec;
+		const pubrec = (try client.readPacket(&ctx)).?.pubrec;
 		try t.expectEqual(2562, pubrec.packet_identifier);
 		try t.expectEqual(.success, pubrec.reason_code);
 		try t.expectEqual(null, pubrec.reason_string);
@@ -2373,7 +2126,7 @@ test "Client: readPacket pubrec" {
 			7,                       // properties length
 			31, 0, 4, 'n', 'o', 'p', 'e'
 		});
-		const pubrec = (try client.readPacket(&ctx)).pubrec;
+		const pubrec = (try client.readPacket(&ctx)).?.pubrec;
 		try t.expectEqual(3, pubrec.packet_identifier);
 		try t.expectEqual(.not_authorized, pubrec.reason_code);
 		try t.expectEqualSlices(u8, "nope", pubrec.reason_string.?);
@@ -2402,7 +2155,7 @@ test "Client: readPacket pubrel" {
 			2,
 			10, 2,                    // packet identifier
 		});
-		const pubrel = (try client.readPacket(&ctx)).pubrel;
+		const pubrel = (try client.readPacket(&ctx)).?.pubrel;
 		try t.expectEqual(2562, pubrel.packet_identifier);
 		try t.expectEqual(.success, pubrel.reason_code);
 		try t.expectEqual(null, pubrel.reason_string);
@@ -2419,7 +2172,7 @@ test "Client: readPacket pubrel" {
 			7,                       // properties length
 			31, 0, 4, 'n', 'o', 'p', 'e'
 		});
-		const pubrel = (try client.readPacket(&ctx)).pubrel;
+		const pubrel = (try client.readPacket(&ctx)).?.pubrel;
 		try t.expectEqual(3, pubrel.packet_identifier);
 		try t.expectEqual(.packet_identifier_not_found, pubrel.reason_code);
 		try t.expectEqualSlices(u8, "nope", pubrel.reason_string.?);
@@ -2448,7 +2201,7 @@ test "Client: readPacket pubcomp" {
 			2,
 			10, 2,                    // packet identifier
 		});
-		const pubcomp = (try client.readPacket(&ctx)).pubcomp;
+		const pubcomp = (try client.readPacket(&ctx)).?.pubcomp;
 		try t.expectEqual(2562, pubcomp.packet_identifier);
 		try t.expectEqual(.success, pubcomp.reason_code);
 		try t.expectEqual(null, pubcomp.reason_string);
@@ -2465,7 +2218,7 @@ test "Client: readPacket pubcomp" {
 			7,                       // properties length
 			31, 0, 4, 'n', 'o', 'p', 'e'
 		});
-		const pubcomp = (try client.readPacket(&ctx)).pubcomp;
+		const pubcomp = (try client.readPacket(&ctx)).?.pubcomp;
 		try t.expectEqual(3, pubcomp.packet_identifier);
 		try t.expectEqual(.packet_identifier_not_found, pubcomp.reason_code);
 		try t.expectEqualSlices(u8, "nope", pubcomp.reason_string.?);
@@ -2490,7 +2243,7 @@ test "Client: readPacket pong" {
 		// special short response
 		ctx.reset();
 		ctx.reply(&.{208, 0});
-		try t.expectEqual(true, (try client.readPacket(&ctx)) == .pong);
+		try t.expectEqual(true, (try client.readPacket(&ctx)).? == .pong);
 	}
 }
 
@@ -2511,7 +2264,7 @@ test "Client: readPacket disconnect" {
 		// short response
 		ctx.reset();
 		ctx.reply(&.{224, 2, 0, 0});
-		const disconnect = (try client.readPacket(&ctx)).disconnect;
+		const disconnect = (try client.readPacket(&ctx)).?.disconnect;
 		try t.expectEqual(.normal, disconnect.reason_code);
 		try t.expectEqual(null, disconnect.reason_string);
 
@@ -2531,7 +2284,7 @@ test "Client: readPacket disconnect" {
 			31, 0, 3, 'b', 'y', 'e',                  // reason string
 			38, 0, 3, 'a', 'b', 'c', 0, 2, 'z', '!'   // another user porperty
 		});
-		const disconnect = (try client.readPacket(&ctx)).disconnect;
+		const disconnect = (try client.readPacket(&ctx)).?.disconnect;
 		try t.expectEqual(.not_authorized, disconnect.reason_code);
 		try t.expectEqualSlices(u8, "bye", disconnect.reason_string.?);
 
@@ -2604,28 +2357,30 @@ const TestContext = struct {
 		self.to_read.appendSlice(self.arena.allocator().dupe(u8, data) catch unreachable) catch unreachable;
 	}
 
-	fn read(self: *TestContext, buf: []u8, _: usize) !usize {
-		const data = self.to_read.items[self.to_read_pos..];
+	const MqttPlatform = struct {
+		fn read(self: *TestContext, buf: []u8, _: usize) !?usize {
+			const data = self.to_read.items[self.to_read_pos..];
 
-		if (data.len == 0 or buf.len == 0) {
-			return 0;
+			if (data.len == 0 or buf.len == 0) {
+				return 0;
+			}
+
+			// randomly fragment the data
+			const to_read = self.random().intRangeAtMost(usize, 1, @min(data.len, buf.len));
+			@memcpy(buf[0..to_read], data[0..to_read]);
+			self.to_read_pos += to_read;
+			return to_read;
 		}
 
-		// randomly fragment the data
-		const to_read = self.random().intRangeAtMost(usize, 1, @min(data.len, buf.len));
-		@memcpy(buf[0..to_read], data[0..to_read]);
-		self.to_read_pos += to_read;
-		return to_read;
-	}
+		fn write(self: *TestContext, data: []const u8) !void {
+			try self.written.appendSlice(data);
+			self.write_count += 1;
+		}
 
-	fn write(self: *TestContext, data: []const u8) !void {
-		try self.written.appendSlice(data);
-		self.write_count += 1;
-	}
-
-	fn close(self: *TestContext) void {
-		self.close_count += 1;
-	}
+		fn close(self: *TestContext) void {
+			self.close_count += 1;
+		}
+	};
 
 	fn random(self: *TestContext) std.rand.Random {
 		if (self._random == null) {

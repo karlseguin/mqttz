@@ -1,3 +1,6 @@
+const mqttz = @import("mqtt.zig");
+const properties = @import("properties.zig");
+
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 
@@ -26,7 +29,6 @@ pub fn writeString(buf: []u8, value: []const u8) error{WriteBufferIsFull}!usize 
 	@memcpy(buf[2..total], value);
 	return total;
 }
-
 
 // This returns the varint value (if we have one) AND the length of the varint
 pub fn readVarint(buf: []const u8) error{InvalidVarint}!?struct{usize, usize} {
@@ -97,6 +99,255 @@ pub fn readString(buf: []const u8) error{InvalidString}!struct{[]const u8, usize
 	}
 	return .{buf[2..end], end};
 }
+
+pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
+	var connect_flags = packed struct(u8) {
+		_reserved: bool = false,
+		clean_start: bool = true,
+		will: bool = false,
+		will_qos: mqttz.QoS = .at_most_once,
+		will_retain: bool = false,
+		username: bool,
+		password: bool,
+	}{
+		.username = opts.username != null,
+		.password = opts.password != null,
+	};
+
+	if (opts.will) |w| {
+		connect_flags.will = true;
+		connect_flags.will_qos = w.qos;
+		connect_flags.will_retain = w.retain;
+	}
+
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	buf[5] = 0;
+	buf[6] = 4;  // length of string, 4: MQTT
+	buf[7] = 'M';
+	buf[8] = 'Q';
+	buf[9] = 'T';
+	buf[10] = 'T';
+
+	buf[11] = 5; // protocol
+
+	buf[12] = @as([*]u8, @ptrCast(@alignCast(&connect_flags)))[0];
+
+	writeInt(u16, buf[13..15], opts.keepalive_sec);
+
+	// everything above is safe, since buf is at least MIN_BUF_SIZE.
+
+	const PROPERTIES_OFFSET = 15;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.CONNECT);
+
+	// Start payload
+	var pos = PROPERTIES_OFFSET + properties_len;
+	pos += try writeString(buf[pos..], opts.client_id orelse "");
+
+	if (opts.will) |will| {
+		pos += try properties.write(buf[pos..], will, &properties.WILL);
+	}
+
+	if (opts.username) |u| {
+		pos += try writeString(buf[pos..], u);
+	}
+
+	if (opts.password) |p| {
+		pos += try writeString(buf[pos..], p);
+	}
+	return encodePacketHeader(buf[0..pos], 1, 0);
+}
+
+pub fn encodeDisconnect(buf: []u8, opts: mqttz.DisconnectOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	buf[5] = @intFromEnum(opts.reason);
+	const PROPERTIES_OFFSET = 6;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.DISCONNECT);
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 14, 0);
+}
+
+pub fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.SubscribeOpts) ![]u8 {
+	const SubscriptionOptions = packed struct(u8) {
+		qos: mqttz.QoS,
+		no_local: bool,
+		retain_as_published: bool,
+		retain_handling: mqttz.RetainHandling,
+		_reserved: u2 = 0,
+	};
+
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+
+	writeInt(u16, buf[5..7], packet_identifier);
+	const PROPERTIES_OFFSET = 7;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.SUBSCRIBE);
+
+	var pos = PROPERTIES_OFFSET + properties_len;
+	for (opts.topics) |topic| {
+		pos += try writeString(buf[pos..], topic.filter);
+		var subscription_options = SubscriptionOptions{
+			.qos = topic.qos,
+			.no_local = topic.no_local,
+			.retain_as_published = topic.retain_as_published,
+			.retain_handling = topic.retain_handling,
+		};
+		buf[pos] = @as([*]u8, @ptrCast(@alignCast(&subscription_options)))[0];
+		pos += 1;
+	}
+
+	return encodePacketHeader(buf[0..pos], 8, 2);
+}
+
+pub fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.UnsubscribeOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	writeInt(u16, buf[5..7], packet_identifier);
+	const PROPERTIES_OFFSET = 7;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.UNSUBSCRIBE);
+
+	var pos = PROPERTIES_OFFSET + properties_len;
+	for (opts.topics) |topic| {
+		pos += try writeString(buf[pos..], topic);
+	}
+
+	return encodePacketHeader(buf[0..pos], 10, 2);
+}
+
+pub fn encodePublish(buf: []u8, packet_identifier: u16, opts: mqttz.PublishOpts) ![]u8 {
+	var publish_flags = PublishFlags{
+		.dup = opts.dup,
+		.qos = opts.qos,
+		.retain = opts.retain,
+	};
+
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	const VARIABLE_HEADER_OFFSET = 5;
+	const topic_len = try writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
+
+
+	var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
+	if (opts.qos != .at_most_once) {
+		// when QoS > 0, we include a packet identifier
+		const packet_identifier_offset = properties_offset;
+		properties_offset += 2;
+		writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], packet_identifier);
+	}
+
+	const properties_len = try properties.write(buf[properties_offset..], opts, &properties.PUBLISH);
+
+	const payload_offset = properties_offset + properties_len;
+	const message = opts.message;
+	const end = payload_offset + message.len;
+	if (end > buf.len) {
+		return error.WriteBufferIsFull;
+	}
+	@memcpy(buf[payload_offset..end], message);
+	return encodePacketHeader(buf[0..end], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
+}
+
+pub fn encodePubAck(buf: []u8, opts: mqttz.PubAckOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBACK);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 64; // packet type (0100) + flags (0000)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 4, 0);
+}
+
+pub fn encodePubRec(buf: []u8, opts: mqttz.PubRecOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREC);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 80; // packet type (0101) + flags (0000)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 5, 0);
+}
+
+pub fn encodePubRel(buf: []u8, opts: mqttz.PubRelOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREL);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 98; // packet type (0101) + flags (0010)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 6, 2);
+}
+
+pub fn encodePubComp(buf: []u8, opts: mqttz.PubCompOpts) ![]u8 {
+	// reserve 1 byte for the packet type
+	// reserve 4 bytes for the packet length (which might be less than 4 bytes)
+	writeInt(u16,  buf[5..7], opts.packet_identifier);
+	buf[7] = @intFromEnum(opts.reason_code);
+	const PROPERTIES_OFFSET = 8;
+	const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBCOMP);
+
+	if (opts.reason_code == .success and properties_len == 1) {
+		// special case, if the reason code is 0 and ther are no properties
+		// we can ommit both, and thus we only have a packet with
+		// type+flag, length (of 2), 2 byte packet_identifier
+		buf[3] = 112; // packet type (0111) + flags (0000)
+		buf[4] = 2;  // remaining length
+		return buf[3..7];
+	}
+
+	return encodePacketHeader(buf[0..PROPERTIES_OFFSET + properties_len], 7, 0);
+}
+
+pub fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
+	const remaining_len = buf.len - 5;
+	const length_of_len = lengthOfVarint(remaining_len);
+
+	// This is where, in buf, our packet is actually going to start. You'd think
+	// it would start at buf[0], but the package length is variable, so it'll
+	// only start at buf[0] in the [unlikely] case where the length took 4 bytes.
+	const start = 5 - length_of_len - 1;
+
+	buf[start] = (packet_type << 4) | packet_flags;
+	_ = writeVarint(buf[start+1..], remaining_len);
+	return buf[start..];
+}
+
+pub const PublishFlags = packed struct(u4) {
+	dup: bool,
+	qos: mqttz.QoS,
+	retain: bool,
+};
+
 
 const t = @import("std").testing;
 test "codec: writeVarint" {

@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) !void {
 	{
 		// Setup Tests
 		const lib_test = b.addTest(.{
-			.root_source_file = b.path("src/mqtt.zig"),
+			.root_source_file = b.path("src/posix.zig"),
 			.target = target,
 			.optimize = optimize,
 			.test_runner = b.path("test_runner.zig"),

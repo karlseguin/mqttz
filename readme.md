@@ -1,6 +1,6 @@
 # MQTT Client for Zig
 
-This is a [hopefully] embed-friendly MQTT client library for Zig. Currently, the focus is on writing a foundation that can be extended, based on needs and the capacity of the platform. The library does not use the standard library and thus requires users to provide some of the implementation.
+This is a embedded-friendly MQTT client library for Zig. Currently, the focus is on writing a foundation that can be extended, based on needs and the capacity of the platform. The library does not use the standard library and thus requires users to provide some of the implementation.
 
 A higher-level wrapper that uses the standard library is planned.
 
@@ -13,9 +13,9 @@ Then start the publisher via: `zig build example_publisher`.
 You should see 3 messages printed in your subscriber, then both programs will exit. These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
 
 ## Overview
-The approach of `mqtt.Mqtt(T)` is to have T provide the `read`, `write` and `close` functions. This decouples the `Mqtt(T)` library from the platform implementation.
+The approach of `mqtt.Mqtt(T)` is to have T provide the `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions. This decouples the `Mqtt(T)` library from the platform implementation.
 
-Unlike most generic implementations, `Mqtt(T)` never references `T`. It merely calls `T.read()`, `T.write()` and `T.close()` with a per-call specific `anytype`. This provides greater flexibility and facilitates composition.
+Unlike most generic implementations, `Mqtt(T)` never references `T`. It merely calls `T.MqttPlatform.read()`, `T.MqttPlatform.write()` and `T.MqttPlatform.close()` with a per-call specific `anytype`. This provides greater flexibility and facilitates composition.
 
 Consider this partial example which wraps `Mqtt(T)` using `std`:
 
@@ -31,14 +31,16 @@ const Client = struct {
         return self.mqtt.subscribe(self, opts);
     }
 
-    // One of the three methods we must implement
-    pub fn write(self: *Client, data: []const u8) !void {
-        return std.posix.write(self.socket, data);
-    }
+    pub const MqttPlatform = struct {
+        // One of the three methods we must implement
+        pub fn write(client: *Client, data: []const u8) !void {
+            return std.posix.write(client.socket, data);
+        }
+    };
 }
 ```
 
-There's something slightly deceiving about this example. When calling `mqtt.subscribe` our first parameter is `self: *Client`. The first parameter to `write` is also `self: *Client`. It's tempting to think that this is necessary since `mqtt` is of type `mqtt.Mqtt(Client)`, but this is not the case. The following is equally valid:
+There's something slightly deceiving about this example. When calling `mqtt.subscribe` our first parameter is `self: *Client`. The first parameter to `write` is also a `*Client`. It's tempting to think that this is necessary since `mqtt` is of type `mqtt.Mqtt(Client)`, but this is not the case. The following is equally valid:
 
 ```zig
 const Client = struct {
@@ -58,19 +60,23 @@ const Client = struct {
         });
     }
 
-    // One of the three methods we must implement
-    pub fn write(ctx: Client.Context, data: []const u8) !void {
-        std.posix.write(ctx.client.socket, data) catch |err| {
-            if (ctx.method == .publish) {
-                // maybe we want to retry for publish only?
-            }
-            ...
-        };
-    }
+    pub const MqttPlatform = struct {
+        // One of the three methods we must implement
+        pub fn write(ctx: Client.Context, data: []const u8) !void {
+            std.posix.write(ctx.client.socket, data) catch |err| {
+                if (ctx.method == .publish) {
+                    // maybe we want to retry for publish only?
+                }
+                ...
+            };
+        }
+    };
 }
 ```
 
 While it's common that the state you pass into the various `Mqtt(T)` methods will be of type `*T`, this is not required. As we see from this example, we can leverage the `anytype` to include additional context.
+
+The `read`, `write` and `close` functions are wrapped in the `MqttPlatform` container structure only to help avoid conflicts with any `read`, `write` and `close` function you might want on your own type.
 
 ## Flow
 Without being able to make assumptions about the environment and given the fact that MQTT is optionally bidirectional, the library can only provide building blocks. Specifically, while the main methods of `Mqtt(T)` will write the request (relying on `T.write` to do the actual writing), none attempt to read the response. It is the responsibility of the implementation to call `readPacket` either when expecting a response, or periodically when consuming messages.
