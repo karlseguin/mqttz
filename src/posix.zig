@@ -162,13 +162,13 @@ pub const Client = struct {
 		}
 
 		// copy so we can mutate
-		var rw_copy = opts;
+		var rw_copy = rw;
 		if (rw.retries == null) {
 			// unless a retry is explicit set, let's override the default, since we
 			// don't want to reconnect just to disconnect.
 			rw_copy.retries = 0;
 		}
-		return self.mqtt.disconnect(&self.createContext(rw), rw_copy);
+		return self.mqtt.disconnect(&self.createContext(rw_copy), opts);
 	}
 
 	pub fn readPacket(self: *Client, rw: ReadWriteOpts) !?mqttz.Packet {

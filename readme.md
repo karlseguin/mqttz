@@ -3,12 +3,19 @@
 This is a embedding-friendly MQTT client library for Zig. The library has two client: a platform-agnostic low level MQTT client where you bring your own read/write/close function and a higher level client based on Zig's stdlib.
 
 ## Examples
-See example/subscriber.zig and example/publisher.zig for basic examples. While these example use `std` and an allocator (briefly), `mqttz` itself does not rely on `std` and is allocation-free.
+These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
 
-Start the subscriber via: `zig build example_subscriber`. 
-Then start the publisher via: `zig build example_publisher`. 
+The `example` folder contains examples of using both clients. The low-level client is implemented using Zig's standard library. This implementation is very basic and not as feature rich as `mqtt.posix.Client` (i.e. no timeouts) . It is only included to show how to integrate the low-level client within your own platform.
 
-You should see 3 messages printed in your subscriber, then both programs will exit. These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
+To run the low-level clients:
+Start the subscriber via: `zig build example_low_level_subscriber`. 
+Then start the publisher via: `zig build example_low_level_publisher`. 
+
+To run the posix clients:
+Start the subscriber via: `zig build example_posix_subscriber`. 
+Then start the publisher via: `zig build example_posix_publisher`. 
+
+In either case, you should see 3 messages printed in your subscriber, then both programs will exit. 
 
 ## Overview
 Both clients are single-threaded and follow the same paradigm. You'll call functions like `connect`, `subscribe` and `publish` to send messages to the server and call `readPacket`, as needed, to receive messages.

@@ -2,6 +2,8 @@ const codec = @import("codec.zig");
 const properties = @import("properties.zig");
 const PropertyReader = properties.Reader;
 
+pub const posix = @import("posix.zig");
+
 pub const QoS = enum(u2) {
 	at_most_once = 0,
 	at_least_once = 1,
