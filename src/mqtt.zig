@@ -256,7 +256,7 @@ pub fn Mqtt(comptime T: type) type {
 		}
 
 		// Intended to be used for debugging
-		pub fn lastReadPacket(self: *Self) []const u8 {
+		pub fn lastReadPacket(self: *const Self) []const u8 {
 			return self.read_buf[0..self.read_pos];
 		}
 
@@ -489,7 +489,6 @@ pub fn Mqtt(comptime T: type) type {
 		}
 	};
 }
-
 
 // These are only the packets that a client can receive
 // For packets that the client sends, we write the Opts (e.g. ConnectionOpts)

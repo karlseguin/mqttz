@@ -112,6 +112,14 @@ pub const Client = struct {
 		}
 	}
 
+	pub fn lastError(self: *const Client) ?mqttz.ErrorDetail {
+		return self.mqtt.last_error;
+	}
+
+	pub fn lastReadPacket(self: *const Client) []const u8 {
+		return self.mqtt.lastReadPacket();
+	}
+
 	pub fn connect(self: *Client, rw: ReadWriteOpts, opts: mqttz.ConnectOpts) !void {
 		try self.mqtt.connect(&self.createContext(rw), opts);
 	}
@@ -149,7 +157,18 @@ pub const Client = struct {
 	}
 
 	pub fn disconnect(self: *Client, rw: ReadWriteOpts, opts: mqttz.DisconnectOpts) !void {
-		return self.mqtt.disconnect(&self.createContext(rw), opts);
+		if (self.socket == null) {
+			return;
+		}
+
+		// copy so we can mutate
+		var rw_copy = opts;
+		if (rw.retries == null) {
+			// unless a retry is explicit set, let's override the default, since we
+			// don't want to reconnect just to disconnect.
+			rw_copy.retries = 0;
+		}
+		return self.mqtt.disconnect(&self.createContext(rw), rw_copy);
 	}
 
 	pub fn readPacket(self: *Client, rw: ReadWriteOpts) !?mqttz.Packet {
@@ -492,6 +511,16 @@ test "Client: read timeout" {
 	try t.expectEqual(true, elapsed >= 50 and elapsed < 100);
 }
 
+test "Client: read invalid response" {
+	var client = testClient(.{});
+	defer client.deinit();
+
+	_ = try client.publish(.{}, .{.topic = "invalid", .message = ""});
+	try t.expectError(error.Protocol, client.readPacket(.{}));
+	try t.expectEqual(error.UnknownPacketType, client.lastError().?.inner);
+	try t.expectEqualSlices(u8, &.{0, 1, 10}, client.lastReadPacket());
+}
+
 const TestServer = struct {
 	// runs in a thread, but our TestServer itself is single threaded as, currently,
 	// each test only needs 1 connection to the server at a time.
@@ -587,6 +616,12 @@ const TestConn = struct {
 
 					if (std.mem.eql(u8, p.topic, "timeout")) {
 						std.time.sleep(std.time.ns_per_ms * 75);
+						continue;
+					}
+
+					if (std.mem.eql(u8, p.topic, "invalid")) {
+						// we're being asked to write ssome invalid data
+						_ = try posix.write(self.socket, &.{0, 1, 10, 22});
 						continue;
 					}
 

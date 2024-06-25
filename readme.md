@@ -73,6 +73,12 @@ Closes the socket (if it's still open) and releases the `read_buf` and `write_bu
 
 For a clean shutdown, you might want to call `disconnect` before calling `deinit`.
 
+### lastError(self: \*Client) ?mqttz.ErrorDetail
+The library attempts to make errors easy to manage while still providing some detail. The library typically returns a handful of higher-level errors (which makes it easier) while optionally exposing an error payload. The `lastErorr` method returns the error payload. (See the [errors section](#errors).
+
+### lastReadPacket(self: \*Client) []const u8
+The last read packet. Only meant to be used for debugging. Only valid until the next call to `readPacket`.
+
 ### connect(self: \*Client, rw: ReadWriteOpts, opts: ConnectOpts) !void
 Sends a connect packet.
 
@@ -107,7 +113,9 @@ Sends a pubcomb packet. `opts.packet_identifier` must be set. `opts.reason_code`
 Sends a ping packet.
 
 ### disconnect(self: \*Client, rw: ReadWriteOpts, opts: DisconnectOpts) !void
-Sends a disconnect packet. `opts.reason` must be set.
+Sends a disconnect packet. `opts.reason` must be set. This is a no-op if the socket is known to be disconnected (which isn't always the case).
+
+If `rw.retries` is not set, `0` will be set, overriding the default (why retry to connect just to disconnect?).
 
 ### readPacket(self: \*Client, rw: ReadWriteOpts) !?mqttz.Packet
 Reads a packet from the server.
@@ -182,6 +190,8 @@ Writes `data` - presumably from a socket referenced directly or indirectly by `s
 Called with `Mqtt(T).disconnect` is called.
 
 This can be called internally, via `disconnect`, by the library as required by the specification (e.g. when a `connack` response is received with indicating that a session is present, but `clean_start` was specified).
+
+Since `Mqtt(T)` is relatively stateless, it's possible for `close` to be called when your implementations' socket is already closed.
 
 ## Errors
 `Mqtt(T)` methods return errors which are meant to be easy(ish) to manage. The `last_error` field is an optional tagged union that can include additional information. The ideas is to provide a manageable number of error values without sacrificing additional details (which might traditionally be handled by having a much larger error set, which is harder to handle).
@@ -385,5 +395,3 @@ The key and value are only valid as long as the packet is valid (which is only v
 ## lastReadPacket() []const u8
 Returns the full raw packet from the last call to `readPacket`. Might be useful when debugging.
 
-## Timeouts
-Because the error you returned from `T.read` is returned back to your code, you can implement a timeout in `T.read`, return an error, say `error.Timeout`  and then catch/handle that in your call to `readPacket`. It is ok to return such an error, even when `calls > 1` and then to continue with another `readPacket` at some point in the future. Any partial data in the `read_buf` will persist.
