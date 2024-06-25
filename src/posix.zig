@@ -16,13 +16,13 @@ pub const Client = struct {
 	// pickup DNS changes on reconnect.
 	address: Address,
 
-	// messages we read must fit in here.
-	read_buffer: []u8,
+	// if we own the read_buffer, it's our job to free it on deinit
+	read_buf_own: bool,
 
-	// messages we write must fit in here
-	write_buffer: []u8,
+	// if we own the write_buffer, it's our job to free it on deinit
+	write_buf_own: bool,
 
-	allocator: Allocator,
+	allocator: ?Allocator,
 
 	connect_timeout: i32,
 
@@ -35,13 +35,25 @@ pub const Client = struct {
 
 	pub const Opts = struct {
 		port: u16,
+
+		// either ip or host must be provided
 		ip: ?[]const u8 = null,
 		host: ?[]const u8 = null,
-		read_buffer_size: u16 = 8192,
-		write_buffer_size: u16 = 8192,
+
 		connect_timeout: i32 = 10_000,
 		default_retries: ?u16 = null,
 		default_timeout: ?i32 = null,
+
+		// required if host != null OR read_buffer == null OR write_buffer == null
+		allocator: ?Allocator = null,
+
+		// if null, we'll use allocator to create a buffer of read_buffer_size
+		read_buf: ?[]u8 = null,
+		read_buf_size: u16 = 8192,
+
+		// if null, we'll use allocator to create a buffer of read_buffer_size
+		write_buf: ?[]u8 = null,
+		write_buf_size: u16 = 8192,
 	};
 
 	const ReadWriteOpts = struct {
@@ -49,12 +61,28 @@ pub const Client = struct {
 		timeout: ?i32 = null,
 	};
 
-	pub fn init(allocator: Allocator, opts: Opts) !Client {
-		const read_buffer = try allocator.alloc(u8, opts.read_buffer_size);
-		errdefer allocator.free(read_buffer);
+	pub fn init(opts: Opts) !Client {
+		const allocator = opts.allocator;
 
-		const write_buffer= try allocator.alloc(u8, opts.write_buffer_size);
-		errdefer allocator.free(write_buffer);
+		if (allocator == null and (opts.ip == null or opts.read_buf == null or opts.write_buf == null)) {
+			return error.AllocatorRequired;
+		}
+
+		var read_buf_own = false;
+		var read_buf = opts.read_buf;
+		if (read_buf == null) {
+			read_buf_own = true;
+			read_buf = try allocator.?.alloc(u8, opts.read_buf_size);
+		}
+		errdefer if (read_buf_own) allocator.?.free(read_buf.?);
+
+		var write_buf_own = false;
+		var write_buf = opts.write_buf;
+		if (write_buf == null) {
+			write_buf_own = true;
+			write_buf = try allocator.?.alloc(u8, opts.write_buf_size);
+		}
+		errdefer if (write_buf_own) allocator.?.free(write_buf.?);
 
 		const address = try Address.init(opts.host, opts.ip, opts.port);
 
@@ -62,69 +90,70 @@ pub const Client = struct {
 			.socket = null,
 			.address = address,
 			.allocator = allocator,
-			.read_buffer = read_buffer,
-			.write_buffer = write_buffer,
+			.read_buf_own = read_buf_own,
+			.write_buf_own = write_buf_own,
 			.connect_timeout = opts.connect_timeout,
 			.default_retries = opts.default_retries orelse 1,
 			.default_timeout = opts.default_timeout orelse 5_000,
-			.mqtt = mqttz.Mqtt(Client).init(read_buffer, write_buffer),
+			.mqtt = mqttz.Mqtt(Client).init(read_buf.?, write_buf.?),
 		};
 	}
 
 	pub fn deinit(self: *Client) void {
 		self.close();
+
 		const allocator = self.allocator;
-		allocator.free(self.read_buffer);
-		allocator.free(self.write_buffer);
-	}
-
-	pub fn connect(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.ConnectOpts) !void {
-		// create a copy so we can mutate it.
-		var mqtt_opts_copy = mqtt_opts;
-		if (mqtt_opts.receive_maximum == null) {
-			mqtt_opts_copy.receive_maximum = @intCast(self.write_buffer.len);
+		if (self.read_buf_own) {
+			allocator.?.free(self.mqtt.read_buf);
 		}
-		try self.mqtt.connect(&self.createContext(opts), mqtt_opts_copy);
+
+		if (self.write_buf_own) {
+			allocator.?.free(self.mqtt.write_buf);
+		}
 	}
 
-	pub fn publish(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.PublishOpts) !usize {
-		return self.mqtt.publish(&self.createContext(opts), mqtt_opts);
+	pub fn connect(self: *Client, rw: ReadWriteOpts, opts: mqttz.ConnectOpts) !void {
+		try self.mqtt.connect(&self.createContext(rw), opts);
 	}
 
-	pub fn subscribe(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.SubscribeOpts) !usize {
-		return self.mqtt.subscribe(&self.createContext(opts), mqtt_opts);
+	pub fn publish(self: *Client, rw: ReadWriteOpts, opts: mqttz.PublishOpts) !?u16 {
+		return self.mqtt.publish(&self.createContext(rw), opts);
 	}
 
-	pub fn unsubscribe(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.UnsubscribeOpts) !usize {
-		return self.mqtt.unsubscribe(&self.createContext(opts), mqtt_opts);
+	pub fn subscribe(self: *Client, rw: ReadWriteOpts, opts: mqttz.SubscribeOpts) !u16 {
+		return self.mqtt.subscribe(&self.createContext(rw), opts);
 	}
 
-	pub fn puback(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.UnsubscribeOpts) !void {
-		return self.mqtt.puback(&self.createContext(opts), mqtt_opts);
+	pub fn unsubscribe(self: *Client, rw: ReadWriteOpts, opts: mqttz.UnsubscribeOpts) !u16 {
+		return self.mqtt.unsubscribe(&self.createContext(rw), opts);
 	}
 
-	pub fn pubrec(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.PubRecOpts) !void {
-		return self.mqtt.pubrec(&self.createContext(opts), mqtt_opts);
+	pub fn puback(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubAckOpts) !void {
+		return self.mqtt.puback(&self.createContext(rw), opts);
 	}
 
-	pub fn pubrel(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.PubRelOpts) !void {
-		return self.mqtt.pubrel(&self.createContext(opts), mqtt_opts);
+	pub fn pubrec(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubRecOpts) !void {
+		return self.mqtt.pubrec(&self.createContext(rw), opts);
 	}
 
-	pub fn pubcomp(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.PubCompOpts) !void {
-		return self.mqtt.pubcomp(&self.createContext(opts), mqtt_opts);
+	pub fn pubrel(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubRelOpts) !void {
+		return self.mqtt.pubrel(&self.createContext(rw), opts);
 	}
 
-	pub fn ping(self: *Client, opts: ReadWriteOpts) !void {
-		return self.mqtt.ping(&self.createContext(opts),);
+	pub fn pubcomp(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubCompOpts) !void {
+		return self.mqtt.pubcomp(&self.createContext(rw), opts);
 	}
 
-	pub fn disconnect(self: *Client, opts: ReadWriteOpts, mqtt_opts: mqttz.DisconnectOpts) !void {
-		return self.mqtt.disconnect(&self.createContext(opts), mqtt_opts);
+	pub fn ping(self: *Client, rw: ReadWriteOpts) !void {
+		return self.mqtt.ping(&self.createContext(rw),);
 	}
 
-	pub fn readPacket(self: *Client, opts: ReadWriteOpts) !?mqttz.Packet {
-		return self.mqtt.readPacket(&self.createContext(opts));
+	pub fn disconnect(self: *Client, rw: ReadWriteOpts, opts: mqttz.DisconnectOpts) !void {
+		return self.mqtt.disconnect(&self.createContext(rw), opts);
+	}
+
+	pub fn readPacket(self: *Client, rw: ReadWriteOpts) !?mqttz.Packet {
+		return self.mqtt.readPacket(&self.createContext(rw));
 	}
 
 	fn getOrConnectSocket(self: *Client) !posix.socket_t {
@@ -142,11 +171,11 @@ pub const Client = struct {
 		}
 	}
 
-	fn createContext(self: *Client, opts: ReadWriteOpts) MqttPlatform.Context {
+	fn createContext(self: *Client, rw: ReadWriteOpts) MqttPlatform.Context {
 		return .{
 			.client = self,
-			.retries = opts.retries orelse self.default_retries,
-			.timeout = opts.timeout orelse self.default_timeout,
+			.retries = rw.retries orelse self.default_retries,
+			.timeout = rw.timeout orelse self.default_timeout,
 		};
 	}
 
@@ -313,7 +342,7 @@ const Address = struct {
 		return .{.host = .{.name = host, .port = port}};
 	}
 
-	fn connect(self: *Address, allocator: Allocator, timeout: i32) !posix.socket_t {
+	fn connect(self: *Address, allocator: ?Allocator, timeout: i32) !posix.socket_t {
 		if (self.address) |addr| {
 			// we were given an ip:port, so the address is fixed
 			return connectTo(addr, timeout);
@@ -323,7 +352,7 @@ const Address = struct {
 		// The address can change (DNS can be updated), and there can be multiple
 		// IPs, hence why we don't convert host:ip -> net.Address in init.
 		const host = self.host.?;
-		const list = try net.getAddressList(allocator, host.name, host.port);
+		const list = try net.getAddressList(allocator.?, host.name, host.port);
 		defer list.deinit();
 
 		if (list.addrs.len == 0) {
@@ -378,14 +407,24 @@ test {
 }
 
 test "Client: invalid config" {
-	try t.expectError(error.HostOrIPRequired, Client.init(t.allocator, .{.port = 0}));
+	try t.expectError(error.HostOrIPRequired, Client.init(.{.port = 0, .allocator = t.allocator}));
+
+	// host specified
+	try t.expectError(error.AllocatorRequired, Client.init(.{.port = 0, .host = "123", .read_buf = &[_]u8{}, .write_buf = &[_]u8{}}));
+
+	// no read_buf
+	try t.expectError(error.AllocatorRequired, Client.init(.{.port = 0, .ip = "", .write_buf = &[_]u8{}}));
+
+	// no write_buf
+	try t.expectError(error.AllocatorRequired, Client.init(.{.port = 0, .ip = "", .read_buf = &[_]u8{}}));
 }
 
 test "Client: connect timeout" {
-	var client = try Client.init(t.allocator, .{
+	var client = try Client.init(.{
 		.port = 1883,
 		.ip = "10.255.255.1", // unroutable
 		.connect_timeout = 10,
+		.allocator = t.allocator,
 	});
 
 	defer client.deinit();
@@ -407,6 +446,24 @@ test "Client: read error" {
 
 test "Client: retry1" {
 	var client = testClient(.{});
+	defer client.deinit();
+
+	_ = try client.publish(.{}, .{.topic = "retry1", .message = ""});
+	const publish = (try client.readPacket(.{.retries = 1})).?.publish;
+	try t.expectEqualSlices(u8, "retry1-ok", publish.topic);
+}
+
+test "Client: retry1 - no alloc" {
+	// This test is testing that the client works when no allocator is provided,
+	// so long as the correct initialize arguments are included
+
+	var buf: [128]u8 = undefined;
+	var client = try Client.init(.{
+		.port = 6588,
+		.ip = "127.0.0.1",
+		.read_buf = &buf,  // should not be the same!
+		.write_buf = &buf, // should not be the same!
+	});
 	defer client.deinit();
 
 	_ = try client.publish(.{}, .{.topic = "retry1", .message = ""});
@@ -584,8 +641,9 @@ const TestConn = struct {
 
 fn testClient(opts: anytype) Client {
 	_ = opts; // not currently used
-	return Client.init(t.allocator, .{
+	return Client.init(.{
 		.port = 6588,
-		.ip = "127.0.0.1"
+		.ip = "127.0.0.1",
+		.allocator = t.allocator,
 	}) catch unreachable;
 }

@@ -1,8 +1,6 @@
 # MQTT Client for Zig
 
-This is a embedded-friendly MQTT client library for Zig. Currently, the focus is on writing a foundation that can be extended, based on needs and the capacity of the platform. The library does not use the standard library and thus requires users to provide some of the implementation.
-
-A higher-level wrapper that uses the standard library is planned.
+This is a embedding-friendly MQTT client library for Zig. The library has two client: a platform-agnostic low level MQTT client where you bring your own read/write/close function and a higher level client based on Zig's stdlib.
 
 ## Examples
 See example/subscriber.zig and example/publisher.zig for basic examples. While these example use `std` and an allocator (briefly), `mqttz` itself does not rely on `std` and is allocation-free.
@@ -13,7 +11,109 @@ Then start the publisher via: `zig build example_publisher`.
 You should see 3 messages printed in your subscriber, then both programs will exit. These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
 
 ## Overview
-The approach of `mqtt.Mqtt(T)` is to have T provide the `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions. This decouples the `Mqtt(T)` library from the platform implementation.
+Both clients are single-threaded and follow the same paradigm. You'll call functions like `connect`, `subscribe` and `publish` to send messages to the server and call `readPacket`, as needed, to receive messages.
+
+The "as needed" part of `readPacket` is where things get interesting. MQTT is bidirectional. If you write a `subscribe` message, you'd reasonably expect to receive a `suback`, but you could also get a `disconnect` AND, if you had previously subscribed to another topic, you could get a `publish`.
+
+This is why even the higher level client doesn't run a background "read" thread nor does it expose a more linear request->response API (e.g. why the return value of `subscribe(...)` isn't a `Packet.Suback`). The message received after "subscribe" might not be "suback".
+
+If you're just publishing, the flow is straightforward (especially if you're using the default `at_most_once` QoS). Things are similarly straightforward if you're subscribing (possibly to more than 1 topic, but in a single `subscribe` message) and then receiving.
+
+This generally means that you need to call `readPacket` in a loop (until you get the expected message) and defensively handle different packet types. If you're subscribed to topics, you'll need to periodically (say, every second) call `readPacket` to check for new messages.
+
+See the examples in the `example` folder.
+
+## mqtt.posix.Client
+`mqtt.posix.Client` is a higher level library that uses Zig's standard library and should be the preferred client to use if Zig's standard library is available.
+
+The client supports timeouts and automatic reconnects. It can optionally be configured without an allocator.
+
+### ReadWriteOpts
+All methods are thin wrappers around the lower-level `mqtt.Mqtt(t)`. However, an additional optional parameter has been added (Zig doesn't make composing options easy, so I opted for just adding another parameter - sorry!).
+
+Where the low-level signature is `publish(opts: SubscribeOpts)` the higher-level signature is: `publish(rw: ReadWriteOpts, opts: SubscribeOpts)`. `ReadWriteOpts` allows overriding the default `retries` and `timeout`.
+
+```zig
+client.publish(.{
+    .retries 3,
+    .timeout = 10_000,
+}, .{
+    .topic = "saiyan/goku/power",
+    .message = "over 9000!",
+});
+```
+
+If a timeout is reached when writing a packet, `error.Timeout` will be returned. If a timeout is reached when `readPacket` is called, `null` will be returned. This allows clients to use a short timeout to periodically check for new packet.
+
+The client will automatically attempt to reconnect and continue the operation when `retries > 0`. When `retries` reaches 0, the underlying error is returned. At this point, the `client` can still be used as any subsequent write/reads will automatically attempt to reconnect.
+
+### init(opts: Client.Opts) !Client
+Initializes the client. This does not open a TCP connection to the server. 
+
+Options are:
+
+* `port: u16` - required
+* `ip: ?[]const u8 = null` - Either `ip` or `host` is required
+* `host: ?[]const u8 = null` -  - Either `ip` or `host` is required
+* `connect_timeout: i32 = 10_000` - Time in milliseconds to try to connect
+* `default_retries: ?u16 = null` - When either reading/writing data from/to the server, the default number of times to automatically reconnect and retry on connection failure. Can be overridden on a per-call basis.
+* `default_timeout: ?i32 = null` - When either reading/writing data from/to the server, the default timeout in milliseconds, to block. Can be overridden on a per-call basis.
+* `allocator: ?Allocator = null` - Optional if `ip` is used instead of `host` and both `read_buf` and `write_buf` are provided.
+* `read_buf: ?[]u8 = null` - The buffer to read messages from the server into. If unspecified, the provided `allocator` will be used to create a buffer of `read_buf_size`. 
+* `read_buf_size: u16 = 8192` - See `read_buf`.
+* `write_buf: ?[]u8 = null` - The buffer to write messages to the server into. If unspecified, the provided `allocator` will be used to create a buffer of `write_buf_size`. 
+* `write_buf_size: u16 = 8192` - See `write_buf`.
+
+When `host` is specified, `std.net.getAddressList` is used to resolve and try each possible address. This happens on each reconnection attempt. This is why an `allocator` must be provided when `host` is used.
+
+Trying to read a message from the server which is larger than `read_buf` (or `read_buf_size` will result in an `error.ReadBufferIsFull`. Similarly, trying to write a message larger than `write_buf` (or `write_buf_size`) will result in an `error.WriteBufferIsFull`.
+
+## deinit(self: \*Client) void
+Closes the socket (if it's still open) and releases the `read_buf` and `write_buf` if they are owned by the client.
+
+For a clean shutdown, you might want to call `disconnect` before calling `deinit`.
+
+### connect(self: \*Client, rw: ReadWriteOpts, opts: ConnectOpts) !void
+Sends a connect packet.
+
+### publish(self: \*Client, rw: ReadWriteOpts, opts: PublishOpts) !?u16
+Sends a publish packet. If `opts.qos` was either `at_least_once` or `exactly_once`, then the returned value is the packet identifier, else it is null. The packet identifier is used to pair this publish with `puback`, `pubrec`, `pubrel` or `pubcomp` packets received from `readPacket`.
+
+The packet identifier is an incrementing integer. It can also be explicitly set via `opts.packet_identifier`.
+
+### subscribe(self: \*Client, rw: ReadWriteOpts, opts: SubscribeOpts) !u16
+Sends a subscribe packet. The return value is a packet identifier used to pair this message with the corresponding suback message read via `readPacket`. 
+
+The packet identifier is an incrementing integer. It can also be explicitly set via `opts.packet_identifier`.
+
+### unsubscribe(self: \*Client, rw: ReadWriteOpts, opts: UnsubscribeOpts) !u16
+Sends a unsubscribe packet. The return value is a packet identifier used to pair this message with the corresponding unsuback message read via `readPacket`. 
+
+The packet identifier is an incrementing integer. It can also be explicitly set via `opts.packet_identifier`.
+
+### puback(self: \*Client, rw: ReadWriteOpts, opts: PubAckOpts) !void
+Sends a puback packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
+
+### pubrec(self: \*Client, rw: ReadWriteOpts, opts: PubRecOpts) !void
+Sends a pubrec packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
+
+### pubrel(self: \*Client, rw: ReadWriteOpts, opts: PubRelOpts) !void
+Sends a pubrel packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
+
+### pubcomp(self: \*Client, rw: ReadWriteOpts, opts: PubCompOpts) !void
+Sends a pubcomb packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
+
+### ping(self: \*Client, rw: ReadWriteOpts) !void
+Sends a ping packet.
+
+### disconnect(self: \*Client, rw: ReadWriteOpts, opts: DisconnectOpts) !void
+Sends a disconnect packet. `opts.reason` must be set.
+
+### readPacket(self: \*Client, rw: ReadWriteOpts) !?mqttz.Packet
+Reads a packet from the server.
+
+## mqtt.Mqtt(T)
+The approach of `mqtt.Mqtt(T)` is to have T provide the `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions. This decouples the `Mqtt(T)` library from platform details.
 
 Unlike most generic implementations, `Mqtt(T)` never references `T`. It merely calls `T.MqttPlatform.read()`, `T.MqttPlatform.write()` and `T.MqttPlatform.close()` with a per-call specific `anytype`. This provides greater flexibility and facilitates composition.
 
@@ -28,144 +128,58 @@ const Client = struct {
     pub fn subscribe(self: *Client, opts: mqtt.SubscribeOpts) !usize {
         // the first parameter is an anytype and will be passed to the
         // read/write/close function as is
-        return self.mqtt.subscribe(self, opts);
+        return self.mqtt.subscribe(MqttPlatform.Context{
+            .client = self,
+            .timeout = 5000,
+        }, opts);
     }
 
     pub const MqttPlatform = struct {
-        // One of the three methods we must implement
-        pub fn write(client: *Client, data: []const u8) !void {
-            return std.posix.write(client.socket, data);
-        }
-    };
-}
-```
-
-There's something slightly deceiving about this example. When calling `mqtt.subscribe` our first parameter is `self: *Client`. The first parameter to `write` is also a `*Client`. It's tempting to think that this is necessary since `mqtt` is of type `mqtt.Mqtt(Client)`, but this is not the case. The following is equally valid:
-
-```zig
-const Client = struct {
-    mqtt: mqtt.Mqtt(Client),
-    socket: std.posix.socket_t,
-
-    // wrap mqtt.publish
-    pub fn publish(self: *Client, topic: []const u8, message: []const u8) !usize {
-        const ctx = Client.Context{
-            .client = self,
-            .method = .publish,
+        const Context = struct {
+            client: *Client,
+            timeout: i32,
         };
 
-        return self.mqtt.publish(ctx, .{
-            .topic = topic,
-            .message = .message,
-        });
-    }
+        pub fn write(ctx: *Context, data: []const u8) !void {
+            // todo implement timeout using ctx.timeout
+            // (the real mqtt.posix.Client has timeout support)
+            return std.posix.write(ctx.client.socket, data);
+        }
 
-    pub const MqttPlatform = struct {
-        // One of the three methods we must implement
-        pub fn write(ctx: Client.Context, data: []const u8) !void {
-            std.posix.write(ctx.client.socket, data) catch |err| {
-                if (ctx.method == .publish) {
-                    // maybe we want to retry for publish only?
-                }
-                ...
-            };
+        pub fn read(ctx: *Context, buf: [] u8) !?usize {
+            // todo implement timeout using ctx.timeout
+            // (the real mqtt.posix.Client has timeout support)
+            return try std.posix.read(ctx.client.socket, buf);
+        }
+
+        pub fn close(ctx: *Context) void {
+            std.posix.close(cts.socket);
         }
     };
 }
 ```
 
-While it's common that the state you pass into the various `Mqtt(T)` methods will be of type `*T`, this is not required. As we see from this example, we can leverage the `anytype` to include additional context.
+While it's common that the state you pass into the various `Mqtt(T)` methods will be of type `*T`, as we can see from the above, this is not required. 
 
 The `read`, `write` and `close` functions are wrapped in the `MqttPlatform` container structure only to help avoid conflicts with any `read`, `write` and `close` function you might want on your own type.
 
-## Flow
-Without being able to make assumptions about the environment and given the fact that MQTT is optionally bidirectional, the library can only provide building blocks. Specifically, while the main methods of `Mqtt(T)` will write the request (relying on `T.write` to do the actual writing), none attempt to read the response. It is the responsibility of the implementation to call `readPacket` either when expecting a response, or periodically when consuming messages.
-
-In cases, where you're either writing just a publisher or just a consumer, the flow is straightforward (and probably could be handled by the library). However, where a single connection is used to both publish and subscribe the flow isn't as straight forward. Essentially, whenever you `readPacket`, depending on your specific used case, you have to be ready to handle different types of packets.
-
-```zig
-var read_buf: [1024]u8 = undefined;
-var write_buf: [1024]u8 = undefined;
-
-var mqtt = try mqtt.Mqtt(Client).init(&read_buf, &write_buf);
-try mqtt.connect(.{});
-switch (try mqtt.readPacket()) {
-    .connack => |connack| {
-        // maybe check some of connack's fields to see
-        // what capabilities the server has?
-    },
-    .disconnect => |disconnect| {
-        // maybe check disconnect.reason_code
-        // and the optional disconnect.reason_string
-        return;
-    },
-    else => // TODO: this should not be possible the server should 
-            // not send any other type of packet at this point
-}
-```
-
-After initializing the connection and calling `connect`, which sends a `CONNACK` packet, the only possible response packets are `connack` or `disconnect`. Next, we subscribe:
-
-```zig
-const packet_identifier = try mqtt.subscribe(some_state, .{
-    .topics = &.{
-        .{.filter = "topic1"}
-    }
-});
-switch (try mqtt.readPacket()) {
-    .suback => |suback| {
-        std.debug.assert(suback.packet_identifier == packet_identifier)
-    },
-    .disconnect => return,
-    else => // TODO: this should not be possible the server should 
-            // not send any other type of packet at this point
-}
-```
-
-Again, only a `suback` or `disconnect` should be possible at this point. And, the `suback.packet_identifier` should be equal to the `packet_identifier` returned by `subscribe`.
-
-Finally, let's make another subscription:
-
-```zig
-const packet_identifier = try mqtt.subscribe(some_state, .{
-    .topics = &.{
-        .{.filter = "topic2"}
-    }
-});
-
-switch (try mqtt.readPacket()) {
-    .suback => |suback| {
-        std.debug.assert(suback.packet_identifier == packet_identifier)
-    },
-    .publish => |publish| {
-        // TODO
-    }
-    .disconnect => return,
-    else => // TODO: this should not be possible the server should 
-            // not send any other type of packet at this point
-}
-```
-
-This time when calling `readPacket` we also handle the possibility of a `publish` packet. This is necessary because we previously subscribed to `topic1`.
-
-### TL;DR
-Implementations are responsible for calling `mqtt.readPacket()`. If your flow is straightforward (e.g. subscribe and then get published messages, or just publishing messages), then mqttz's usage is simple.
-
-## T.read, T.write & T.close
-T must expose `read`, `write` and `close` functions.
+## T.MqttPlatform.
+T must expose `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions.
 
 The first parameter to these functions is the same `anytype` that was passed into the `Mqtt(T)` function that triggered it.
 
-### T.read(state: anytype, buf: []u8, calls: usize) !usize
-Reads data into `buf` - presumably from a socket referenced directly or indirectly by `state`. Returns the number of bytes read. If 0 is returned, assumes the connection is closed.
+### T.MqttPlatform.read(state: anytype, buf: []u8, calls: usize) !?usize
+Reads data into `buf` - presumably from a socket referenced directly or indirectly by `state`. Returns the number of bytes read. If `0` is returned, assumes the connection is closed. 
 
-Only `Mqtt(T).readPacket` can currently trigger a call to `T.read`. For a single call to `Mqtt(T).readPacket`, `T.read` might be called 0 or more times. It would be called 0 times if a previous call to `readPacket` had caused multiple packets to be read. The `calls` parameter indicates the number of times `T.read` has been called for a single call to `readPacket`
+If `null` is returned, then `null` will be returned from `readPacket`. Returning `null` is how timeouts should be implemented, to indicate that there is currently no more data.
 
-### T.write(state: anytype, data: []const u8) !void
-Writes `data` - presumably from a socket referenced directly or indirectly by `state`. `T.write` must write all of `data`.
+Only `Mqtt(T).readPacket` can currently trigger a call to `read`. For a single call to `Mqtt(T).readPacket`, `read` might be called 0 or more times. It would be called 0 times if a previous call to `readPacket` had caused multiple packets to be read. The `calls` parameter indicates the number of times `read` has been called for a single call to `readPacket` (it can be ignored in most cases).
 
-### T.close(state: anytype) !void
-Called with `Mqtt(T).disconnect` is called. `disconnect` (and thus `T.close`).
+### T.MqttPlatform.write(state: anytype, data: []const u8) !void
+Writes `data` - presumably from a socket referenced directly or indirectly by `state`. `write` must write all of `data`.
+
+### T.MqttPlatform.close(state: anytype) !void
+Called with `Mqtt(T).disconnect` is called.
 
 This can be called internally, via `disconnect`, by the library as required by the specification (e.g. when a `connack` response is received with indicating that a session is present, but `clean_start` was specified).
 
@@ -191,7 +205,7 @@ None of the `opts` field are required.
 
 Will call T.write(state, data) exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, any error returned from your `T.write`.
+Possible errors are: `error.WriteBufferIsFull`, any error returned from your `T.MqttPlatform.write`.
 
 ## subscribe(state: anytype, opts: SubscribeOpts) !usize
 `opts` must include at least 1 topic which must contain a filter:
@@ -206,7 +220,7 @@ mqtt.subscribe(&ctx, .{
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Usage`, any error returned from your `T.write`. `error.Usage` happens if no topic is provided.
+Possible errors are: `error.WriteBufferIsFull`, `error.Usage`, any error returned from your `T.MqttPlatform.write`. `error.Usage` happens if no topic is provided.
 
 Returns the `packet_identifier`. The `packet_identifier` can be set explicitly via the `packet_identifier: ?u16 = null` field of the `SubscribeOpts`. Otherwise, an incrementing integer is used. The `packet_identifier` is used to pair the `subscribe` with corresponding `suback` which can be retrieved via `readPacket()`.
 
@@ -221,7 +235,7 @@ mqtt.unsubscribe(&ctx, .{
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Usage` any error returned from your `T.write`. `error.Usage` happens if no topic is provided.
+Possible errors are: `error.WriteBufferIsFull`, `error.Usage` any error returned from your `T.MqttPlatform.write`. `error.Usage` happens if no topic is provided.
 
 Returns the `packet_identifier`. The `packet_identifier` can be set explicitly via the `packet_identifier: ?u16 = null` field of the `UnsubscribeOpts`. Otherwise, an incrementing integer is used. The `packet_identifier` is used to pair the `unsubscribe` with corresponding `unsuback` which can be retrieved via `readPacket()`.
 
@@ -237,7 +251,7 @@ mqtt.public(&ctx, .{
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, `error.Usage` any error returned from your `T.write`. `error.Usage` happens if the `retain` flag is set, but the server announced (via the `connack` message) that it did not support retained messages.
+Possible errors are: `error.WriteBufferIsFull`, `error.Usage` any error returned from your `T.MqttPlatform.write`. `error.Usage` happens if the `retain` flag is set, but the server announced (via the `connack` message) that it did not support retained messages.
 
 Returns the `packet_identifier`. The `packet_identifier` can be set explicitly via the `packet_identifier: ?u16 = null` field of the `PublishOpts`. Otherwise, an incrementing integer is used. The `packet_identifier` is used to pair the `publish` with corresponding `pubrec` or `pubrel` assuming the `qos` option is set.
 
@@ -246,28 +260,28 @@ Returns the `packet_identifier`. The `packet_identifier` can be set explicitly v
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.write`.
+Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.MqttPlatform.write`.
 
 ## pubrec(state: anytype, opts: PubRecOpts) !void
 `opts` must include the `packet_identifer` of the `publish` this message is in response to.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`, any error returned from your `T.write`.
+Possible errors are: `error.WriteBufferIsFull`, any error returned from your `T.MqttPlatform.write`.
 
 ## pubrel(state: anytype, opts: PubRelOpts) !void
 `opts` must include the `packet_identifer` of the `publish` this message is in response to.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.write`.
+Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.MqttPlatform.write`.
 
 ## pubcomp(state: anytype, opts: PubCompOpts) !void
 `opts` must include the `packet_identifer` of the `publish` this message is in response to.
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.write`.
+Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T.MqttPlatform.write`.
 
 ## disconnect(state: anytype. opts: DisconnectOpts) !void
 `opts` must include the `reason` for the disconnect. This is an enum.
@@ -291,12 +305,12 @@ Possible errors are: `error.WriteBufferIsFull`,  any error returned from your `T
 
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: any error returned from your `T.write`.
+Possible errors are: any error returned from your `T.MqttPlatform.write`.
 
 ## ping(state: anytype) !void
 This will call `T.write(state, data)` exactly once.
 
-Possible errors are: any error returned from your `T.write`.
+Possible errors are: any error returned from your `T.MqttPlatform.write`.
 
 ## readPacket(state: anytype) !void
 Attempts to read a packet from the server.

@@ -62,9 +62,13 @@ const Client = struct {
 	fn connect(self: *Client, opts: mqttz.ConnectOpts) !mqttz.Packet.ConnAck {
 		try self.mqtt.connect(self, opts);
 
+		// since this simple demo doesn't implement a timeout, readPacket should
+		// either fail or returna a packet.
+		const packet = (try self.readPacket()) orelse unreachable;
+
 		// after we send a connect, the only valid packets we can get back are
 		// connack and disconnect and disconnect is handled by our readPacket
-		switch (try self.readPacket()) {
+		switch (packet) {
 			.connack => |c| {
 				if (c.reason_code == .success) {
 					return c;
@@ -98,20 +102,21 @@ const Client = struct {
 
 	// nice thing about composition is that it's easy to apply global handling
 	// for various packet types.
-	fn readPacket(self: *Client) !mqttz.Packet {
-		switch (try self.mqtt.readPacket(self)) {
+	fn readPacket(self: *Client) !?mqttz.Packet {
+		if (try self.mqtt.readPacket(self)) |packet| switch (packet) {
 			.disconnect => |d| {
 				std.debug.print("server disconnected: {any}\n", .{d.reason_code});
 				return error.Disconnected;
 			},
-			else => |packet| return packet,
-		}
+			else => return packet,
+		};
+		return null;
 	}
 
 	pub const MqttPlatform = struct {
 		// We must provide a read function
-		pub fn read(self: *Client, buf: []u8, _: usize) !usize {
-			return std.posix.read(self.socket, buf);
+		pub fn read(self: *Client, buf: []u8, _: usize) !?usize {
+			return try std.posix.read(self.socket, buf);
 		}
 
 		// We must provide a write function

@@ -215,7 +215,7 @@ pub fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.Unsubscr
 	return encodePacketHeader(buf[0..pos], 10, 2);
 }
 
-pub fn encodePublish(buf: []u8, packet_identifier: u16, opts: mqttz.PublishOpts) ![]u8 {
+pub fn encodePublish(buf: []u8, packet_identifier: ?u16, opts: mqttz.PublishOpts) ![]u8 {
 	var publish_flags = PublishFlags{
 		.dup = opts.dup,
 		.qos = opts.qos,
@@ -227,13 +227,11 @@ pub fn encodePublish(buf: []u8, packet_identifier: u16, opts: mqttz.PublishOpts)
 	const VARIABLE_HEADER_OFFSET = 5;
 	const topic_len = try writeString(buf[VARIABLE_HEADER_OFFSET..], opts.topic);
 
-
 	var properties_offset = VARIABLE_HEADER_OFFSET + topic_len;
-	if (opts.qos != .at_most_once) {
-		// when QoS > 0, we include a packet identifier
+	if (packet_identifier) |pi| {
 		const packet_identifier_offset = properties_offset;
 		properties_offset += 2;
-		writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], packet_identifier);
+		writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], pi);
 	}
 
 	const properties_len = try properties.write(buf[properties_offset..], opts, &properties.PUBLISH);

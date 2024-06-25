@@ -267,7 +267,7 @@ pub fn Mqtt(comptime T: type) type {
 			try self.writePacket(state, connect_packet);
 		}
 
-		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) (WriteError || error{Usage, WriteBufferIsFull})!usize {
+		pub fn subscribe(self: *Self, state: anytype, opts: SubscribeOpts) (WriteError || error{Usage, WriteBufferIsFull})!u16 {
 			if (opts.topics.len == 0) {
 				self.last_error = .{.details = "must have at least 1 topic"};
 				return error.Usage;
@@ -279,7 +279,7 @@ pub fn Mqtt(comptime T: type) type {
 			return packet_identifier;
 		}
 
-		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) (WriteError || error{Usage, WriteBufferIsFull})!usize {
+		pub fn unsubscribe(self: *Self, state: anytype, opts: UnsubscribeOpts) (WriteError || error{Usage, WriteBufferIsFull})!u16 {
 			if (opts.topics.len == 0) {
 				self.last_error = .{.details = "must have at least 1 topic"};
 				return error.Usage;
@@ -291,7 +291,7 @@ pub fn Mqtt(comptime T: type) type {
 			return packet_identifier;
 		}
 
-		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) (WriteError || error{Usage, WriteBufferIsFull})!usize {
+		pub fn publish(self: *Self, state: anytype, opts: PublishOpts) (WriteError || error{Usage, WriteBufferIsFull})!?u16 {
 			if (opts.retain == true and self.server_can_retain == false) {
 				self.last_error = .{.details = "server does not support retained messages"};
 				return error.Usage;
@@ -300,7 +300,13 @@ pub fn Mqtt(comptime T: type) type {
 				self.last_error = .{.details = "server does not support this level of QoS"};
 				return error.Usage;
 			}
-			const packet_identifier = self.packetIdentifier(opts.packet_identifier);
+
+			var packet_identifier: ?u16 = null;
+			if (opts.qos != .at_most_once) {
+				// when QoS > 0, we include a packet identifier
+				packet_identifier = self.packetIdentifier(opts.packet_identifier);
+			}
+
 			const publish_packet = try codec.encodePublish(self.write_buf, packet_identifier, opts);
 			try self.writePacket(state, publish_packet);
 			return packet_identifier;
@@ -342,7 +348,7 @@ pub fn Mqtt(comptime T: type) type {
 			if (explicit) |pi| {
 				return pi;
 			}
-			const pi = self.packet_identifier + 1;
+			const pi = self.packet_identifier +% 1;
 			self.packet_identifier = pi;
 			return pi;
 		}
@@ -1416,7 +1422,7 @@ test "Client: publish" {
 			.message = "over 9000!!",
 		});
 
-		try t.expectEqual(20, pi);
+		try t.expectEqual(null, pi);
 
 		try ctx.expectWritten(1, &.{
 			48,                        // packet type (0011 0000)  (3 for the packet type, 0 since no flag is set)
