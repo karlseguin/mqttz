@@ -2319,7 +2319,7 @@ const TestContext = struct {
 	written: std.ArrayList(u8),
 	write_count: usize,
 	close_count: usize,
-	_random: ?std.rand.DefaultPrng = null,
+	_random: ?std.Random.DefaultPrng = null,
 	client: Mqtt(TestContext),
 
 	const std = @import("std");
@@ -2389,11 +2389,11 @@ const TestContext = struct {
 		}
 	};
 
-	fn random(self: *TestContext) std.rand.Random {
+	fn random(self: *TestContext) std.Random {
 		if (self._random == null) {
 			var seed: u64 = undefined;
 			std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
-			self._random = std.rand.DefaultPrng.init(seed);
+			self._random = std.Random.DefaultPrng.init(seed);
 		}
 		return self._random.?.random();
 	}
