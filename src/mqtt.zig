@@ -262,7 +262,7 @@ pub fn Mqtt(comptime T: type) type {
 			return self.read_buf[0..self.read_pos];
 		}
 
-		const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).Fn.return_type.?).ErrorUnion.error_set;
+		const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).@"fn".return_type.?).error_union.error_set;
 
 		pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) (WriteError || error{WriteBufferIsFull})!void {
 			const connect_packet = try codec.encodeConnect(self.write_buf, opts);
@@ -364,7 +364,7 @@ pub fn Mqtt(comptime T: type) type {
 			ReadBufferIsFull,
 			Protocol,
 			MalformedPacket,
-		} || @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.read)).Fn.return_type.?).ErrorUnion.error_set;
+		} || @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.read)).@"fn".return_type.?).error_union.error_set;
 
 		pub fn readPacket(self: *Self, state: anytype) ReadError!?Packet {
 			const p = (try self.readOrBuffered(state)) orelse return null;

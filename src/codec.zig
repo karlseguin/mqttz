@@ -79,11 +79,11 @@ pub fn lengthOfVarint(len: usize) usize {
 	};
 }
 
-pub inline fn writeInt(comptime T: type, buf: *[@divExact(@typeInfo(T).Int.bits, 8)]u8, value: T) void {
+pub inline fn writeInt(comptime T: type, buf: *[@divExact(@typeInfo(T).int.bits, 8)]u8, value: T) void {
 	buf.* = @bitCast(if (native_endian == .big) value else @byteSwap(value));
 }
 
-pub inline fn readInt(comptime T: type, buf: *const [@divExact(@typeInfo(T).Int.bits, 8)]u8) T {
+pub inline fn readInt(comptime T: type, buf: *const [@divExact(@typeInfo(T).int.bits, 8)]u8) T {
 	const value: T = @bitCast(buf.*);
 	return if (native_endian == .big) value else @byteSwap(value);
 }

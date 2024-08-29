@@ -158,7 +158,7 @@ pub fn write(buf: []u8, value: anytype, comptime properties: []const PropertyTyp
 				},
 				else => {
 					switch (@typeInfo(@TypeOf(v))) {
-						.Enum => {
+						.@"enum" => {
 							buf[pos] = @intFromEnum(property);
 							buf[pos + 1] = @intFromEnum(v);
 							pos += 2;
@@ -191,7 +191,7 @@ fn writeLen(value: anytype, comptime properties: []const PropertyType) usize {
 				},
 				else => {
 					switch (@typeInfo(@TypeOf(v))) {
-						.Enum => l += 2,
+						.@"enum" => l += 2,
 						else => unreachable,
 					}
 				},
@@ -259,7 +259,7 @@ pub const Reader = struct {
 			self.buf = buf[property_end..];
 			return .{.user_properties = buf};
 		} else {
-			inline for (@typeInfo(Property).Union.fields) |field| {
+			inline for (@typeInfo(Property).@"union".fields) |field| {
 				if (property_type == @intFromEnum(@field(PropertyType, field.name))) {
 					const value, const len = try readValue(field.type, buf[1..]);
 
