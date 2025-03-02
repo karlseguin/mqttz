@@ -1,7 +1,8 @@
 .{
-  .name = "mqttz",
+  .name = .mqttz,
   .paths = .{""},
   .version = "0.0.0",
+  .fingerprint = 0xdc786744ff4401cb,
   .dependencies = .{
   },
 }
