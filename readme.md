@@ -75,6 +75,8 @@ When `host` is specified, `std.net.getAddressList` is used to resolve and try ea
 
 Trying to read a message from the server which is larger than `read_buf` (or `read_buf_size` will result in an `error.ReadBufferIsFull`. Similarly, trying to write a message larger than `write_buf` (or `write_buf_size`) will result in an `error.WriteBufferIsFull`.
 
+If you get an `error.ReadBufferIsFull`, you can try to use `client.lastPartialPacket()` which returns a `?PartialPacket`. This is primarily meant to expose the `packet_identifier` of the message which was too large. (Note that, for a Publish message, the packet_identifier comes _after_ the topic, so a very large topic, or a very small `read_buf` will return a `null` value).
+
 ## deinit(self: \*Client) void
 Closes the socket (if it's still open) and releases the `read_buf` and `write_buf` if they are owned by the client.
 

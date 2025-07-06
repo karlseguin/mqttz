@@ -262,6 +262,27 @@ pub fn Mqtt(comptime T: type) type {
             return self.read_buf[0..self.read_pos];
         }
 
+        pub fn readBuffer(self: *const Self) []u8 {
+            return self.read_buf[self.read_pos..self.read_len];
+        }
+
+        pub fn lastPartialPacket(self: *const Self) ?PartialPacket {
+            const buf = self.readBuffer();
+
+            if (buf.len < 2) {
+                return null;
+            }
+
+            const remaining_len, const length_of_len = codec.readVarint(buf[1..]) catch {
+                return null;
+            } orelse return null;
+
+            // +1 for the packet type
+            const fixed_header_len = 1 + length_of_len;
+            const total_len = fixed_header_len + remaining_len;
+            return PartialPacket.decode(buf[0], buf[fixed_header_len..@min(total_len, buf.len)]);
+        }
+
         const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).@"fn".return_type.?).error_union.error_set;
 
         pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) (WriteError || error{WriteBufferIsFull})!void {
@@ -772,6 +793,81 @@ pub const Packet = union(enum) {
     }
 };
 
+pub const PartialPacket = union(enum) {
+    connack: ConnAck,
+    suback: SubAck,
+    unsuback: UnsubAck,
+    publish: Publish,
+    puback: PubAck,
+    pubrec: PubRec,
+    pubrel: PubRel,
+    pubcomp: PubComp,
+    disconnect: Disconnect,
+    pong: void,
+
+    pub const ConnAck = struct {
+    };
+
+    pub const SubAck = struct {
+        packet_identifier: u16,
+    };
+
+    pub const UnsubAck = struct {
+        packet_identifier: u16,
+    };
+
+    pub const Publish = struct {
+        dup: bool,
+        qos: QoS,
+        // not sure what this means in the context of a received message
+        // maybe it's never set, or maybe it indicates that the server is publishing
+        // a message which it retains?
+        retain: bool,
+
+        topic: []const u8,
+        // null when qos is .at_least_once
+        packet_identifier: ?u16,
+    };
+
+    pub const PubAck = struct {
+        packet_identifier: u16,
+    };
+
+    pub const PubRec = struct {
+        packet_identifier: u16,
+    };
+
+    pub const PubRel = struct {
+        packet_identifier: u16,
+    };
+
+    pub const PubComp = struct {
+        packet_identifier: u16,
+    };
+
+    pub const Disconnect = struct {
+    };
+
+    pub fn decode(b1: u8, data: []const u8) ?PartialPacket {
+        // data.len has to be > 0
+        // TODO: how to assert without std?
+        const flags: u4 = @intCast(b1 & 15);
+        switch (b1 >> 4) {
+            2 => return .{ .connack = .{} },
+            3 => return .{ .publish = decodePartialPublish(data, flags) orelse return null },
+            4 => return .{ .puback = decodePartialPubAck(data, flags) orelse return null },
+            5 => return .{ .pubrec = decodePartialPubRec(data, flags) orelse return null },
+            6 => return .{ .pubrel = decodePartialPubRel(data, flags) orelse return null },
+            7 => return .{ .pubcomp = decodePartialPubComp(data, flags) orelse return null },
+            9 => return .{ .suback = decodePartialSubAck(data, flags) orelse return null },
+            11 => return .{ .unsuback = decodePartialUnsubAck(data, flags) orelse return null },
+            13 => if (flags == 0) return .{ .pong = {} } else return null,
+            14 => return .{ .disconnect = .{} },
+            else => return null, // TODO
+        }
+    }
+};
+
 fn decodeConnAck(data: []u8, flags: u4) !Packet.ConnAck {
     if (flags != 0) {
         return error.InvalidFlags;
@@ -889,6 +985,20 @@ fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
     suback.results = data[2 + props.len ..];
     return suback;
 }
+fn decodePartialSubAck(data: []const u8, flags: u4) ?PartialPacket.SubAck {
+    if (flags != 0) {
+        return null;
+    }
+
+    if (data.len < 4) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+}
 
 fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
     if (flags != 0) {
@@ -927,6 +1037,20 @@ fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
     // you would check unsuback.results[1], or better for an enum value: unsuback.result(1).
     unsuback.results = data[2 + props.len ..];
     return unsuback;
+}
+fn decodePartialUnsubAck(data: []const u8, flags: u4) ?PartialPacket.UnsubAck {
+    if (flags != 0) {
+        return null;
+    }
+
+    if (data.len < 4) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
 }
 
 fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
@@ -975,6 +1099,35 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
     }
 
     publish.message = data[properties_offset + props.len ..];
+    return publish;
+}
+fn decodePartialPublish(data: []const u8, flags: u4) ?PartialPacket.Publish {
+    if (data.len < 5) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    const publish_flags: *codec.PublishFlags = @constCast(@ptrCast(&flags));
+
+    const topic, var properties_offset = codec.readString(data) catch {
+        return null;
+    };
+    var publish = PartialPacket.Publish{
+        .dup = publish_flags.dup,
+        .qos = publish_flags.qos,
+        .retain = publish_flags.retain,
+        .topic = topic,
+        .packet_identifier = null,
+    };
+
+    if (publish.qos != .at_most_once) {
+        const packet_identifier_offset = properties_offset;
+        properties_offset += 2;
+        publish.packet_identifier = codec.readInt(u16, data[packet_identifier_offset..properties_offset][0..2]);
+    }
+
     return publish;
 }
 
@@ -1029,6 +1182,20 @@ fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
     }
     return puback;
 }
+fn decodePartialPubAck(data: []const u8, flags: u4) ?PartialPacket.PubAck {
+    if (flags != 0) {
+        return null;
+    }
+
+    if (data.len < 2) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+}
 
 fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
     if (flags != 0) {
@@ -1081,6 +1248,20 @@ fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
     }
     return pubrec;
 }
+fn decodePartialPubRec(data: []const u8, flags: u4) ?PartialPacket.PubRec {
+    if (flags != 0) {
+        return null;
+    }
+
+    if (data.len < 2) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+}
 
 fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
     if (flags != 2) {
@@ -1127,6 +1308,20 @@ fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
         }
     }
     return pubrel;
+}
+fn decodePartialPubRel(data: []const u8, flags: u4) ?PartialPacket.PubRel {
+    if (flags != 0) {
+        return null;
+    }
+
+    if (data.len < 2) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
 }
 
 // If you've gotten this far and are thinking: does he plan on DRYing this stuff?
@@ -1175,6 +1370,20 @@ fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
         }
     }
     return pubcomp;
+}
+fn decodePartialPubComp(data: []const u8, flags: u4) ?PartialPacket.PubComp {
+    if (flags != 0) {
+        return null;
+    }
+
+    if (data.len < 2) {
+        // must have at least 4 bytes
+        // 2 for the packet identifier
+        // at least 1 for a 0-length property list
+        // at least 1 for 1 reason code in the body
+        return null;
+    }
+    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
 }
 
 fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
@@ -2120,7 +2329,7 @@ test "Client: readPacket publish" {
     }
 
     {
-        // qos = at_least_once (will property identifier)
+        // qos = at_least_once (with property identifier)
         ctx.reset();
         ctx.reply(&.{
             50,
@@ -2149,6 +2358,21 @@ test "Client: readPacket publish" {
         try t.expectEqual(null, publish.correlation_data);
         try t.expectEqual(null, publish.subscription_identifier);
         try t.expectEqual(null, publish.content_type);
+    }
+
+    {
+        // too long
+        var buf: [512]u8 = undefined;
+        const msg = try codec.encodePublish(&buf, 9001, .{
+            .topic = "hi",
+            .qos = .at_least_once,
+            .message = "a" ** 300,
+        });
+        ctx.reset();
+        ctx.reply(msg);
+        try t.expectError(error.ReadBufferIsFull, client.readPacket(&ctx));
+        const publish = client.lastPartialPacket().?.publish;
+        try t.expectEqual(9001, publish.packet_identifier.?);
     }
 }
 
