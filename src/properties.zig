@@ -447,9 +447,9 @@ test "properties: Reader" {
             23, 1, // request problem info (u8),
             19, 0x30, 0x65, // server keepalive (u16),
             2, 0x77, 0x35, 0x94, 0x01, // message_expiry_interval (u32),
-            11,  0x81, 0x0a, // subscription_identifier (varint (usize)),
-            9,   0,    3,
-            't', 'e',  'g', // correlation_data ([]const u8)
+            11, 0x81, 0x0a, // subscription_identifier (varint (usize)),
+            9,  0,    3,
+            't', 'e', 'g', // correlation_data ([]const u8)
         }));
         try t.expectEqual(20, r.len);
         try t.expectEqual(true, (try r.next()).?.request_problem_information);

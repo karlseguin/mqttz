@@ -48,7 +48,7 @@ pub fn main() !void {
 	var buf: [50]u8 = undefined;
 	for (9000..9003) |i| {
 		try client.publish("power/goku", try std.fmt.bufPrint(&buf, "over {d}!", .{i}));
-		std.time.sleep(std.time.ns_per_s);
+		std.Thread.sleep(std.time.ns_per_s);
 	}
 }
 

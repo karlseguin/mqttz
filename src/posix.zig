@@ -616,7 +616,7 @@ const TestConn = struct {
                     }
 
                     if (std.mem.eql(u8, p.topic, "timeout")) {
-                        std.time.sleep(std.time.ns_per_ms * 75);
+                        std.Thread.sleep(std.time.ns_per_ms * 75);
                         continue;
                     }
 

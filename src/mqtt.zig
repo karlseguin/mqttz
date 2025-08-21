@@ -805,8 +805,7 @@ pub const PartialPacket = union(enum) {
     disconnect: Disconnect,
     pong: void,
 
-    pub const ConnAck = struct {
-    };
+    pub const ConnAck = struct {};
 
     pub const SubAck = struct {
         packet_identifier: u16,
@@ -845,8 +844,7 @@ pub const PartialPacket = union(enum) {
         packet_identifier: u16,
     };
 
-    pub const Disconnect = struct {
-    };
+    pub const Disconnect = struct {};
 
     pub fn decode(b1: u8, data: []const u8) ?PartialPacket {
         // data.len has to be > 0
@@ -997,7 +995,7 @@ fn decodePartialSubAck(data: []const u8, flags: u4) ?PartialPacket.SubAck {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+    return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
 fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
@@ -1050,7 +1048,7 @@ fn decodePartialUnsubAck(data: []const u8, flags: u4) ?PartialPacket.UnsubAck {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+    return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
 fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
@@ -1194,7 +1192,7 @@ fn decodePartialPubAck(data: []const u8, flags: u4) ?PartialPacket.PubAck {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+    return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
 fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
@@ -1260,7 +1258,7 @@ fn decodePartialPubRec(data: []const u8, flags: u4) ?PartialPacket.PubRec {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+    return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
 fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
@@ -1321,7 +1319,7 @@ fn decodePartialPubRel(data: []const u8, flags: u4) ?PartialPacket.PubRel {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+    return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
 // If you've gotten this far and are thinking: does he plan on DRYing this stuff?
@@ -1383,7 +1381,7 @@ fn decodePartialPubComp(data: []const u8, flags: u4) ?PartialPacket.PubComp {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    return.{.packet_identifier = codec.readInt(u16, data[0..2])};
+    return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
 fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
@@ -1710,7 +1708,7 @@ test "Client: publish" {
             0, 30, // packet identifier
             7, // property length
             1, 1, //payload format
-            2,   0,   0,                            0, 10, // message expiry interval
+            2, 0, 0, 0, 10, // message expiry interval
             'm', '2', 'z', // payload (the message)
         });
     }
@@ -2635,9 +2633,9 @@ test "Client: readPacket disconnect" {
             135, // reason code
             25, // properties length
             38, 0, 1, 'a', 0, 3, '1', '2', '3', // one user property
-            31, 0, 3,   'b',                          'y', 'e', // reason string
-            38, 0, 3,   'a',                          'b', 'c',
-            0,  2, 'z', '!', // another user porperty
+            31, 0, 3, 'b', 'y', 'e', // reason string
+            38, 0, 3, 'a', 'b', 'c',
+            0, 2, 'z', '!', // another user porperty
         });
         const disconnect = (try client.readPacket(&ctx)).?.disconnect;
         try t.expectEqual(.not_authorized, disconnect.reason_code);
@@ -2684,8 +2682,8 @@ const TestContext = struct {
         return .{
             .arena = arena,
             .to_read_pos = 0,
-            .to_read = std.ArrayList(u8).init(allocator),
-            .written = std.ArrayList(u8).init(allocator),
+            .to_read = .empty,
+            .written = .empty,
             .write_count = 0,
             .close_count = 0,
             .client = Mqtt(TestContext).init(read_buf, write_buf),
@@ -2709,7 +2707,8 @@ const TestContext = struct {
     }
 
     fn reply(self: *TestContext, data: []const u8) void {
-        self.to_read.appendSlice(self.arena.allocator().dupe(u8, data) catch unreachable) catch unreachable;
+        const arena = self.arena.allocator();
+        self.to_read.appendSlice(arena, arena.dupe(u8, data) catch unreachable) catch unreachable;
     }
 
     const MqttPlatform = struct {
@@ -2728,7 +2727,8 @@ const TestContext = struct {
         }
 
         fn write(self: *TestContext, data: []const u8) !void {
-            try self.written.appendSlice(data);
+            const arena = self.arena.allocator();
+            try self.written.appendSlice(arena, data);
             self.write_count += 1;
         }
 

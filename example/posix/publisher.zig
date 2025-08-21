@@ -52,6 +52,6 @@ pub fn main() !void {
 			.topic = "power/vegeta",
 			.message = try std.fmt.bufPrint(&buf, "over {d}!", .{i})
 		});
-		std.time.sleep(std.time.ns_per_s);
+		std.Thread.sleep(std.time.ns_per_s);
 	}
 }
