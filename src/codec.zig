@@ -131,7 +131,7 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
 
     buf[11] = 5; // protocol
 
-    buf[12] = @as([*]u8, @ptrCast(@alignCast(&connect_flags)))[0];
+    buf[12] = @bitCast(connect_flags);
 
     writeInt(u16, buf[13..15], opts.keepalive_sec);
 
@@ -187,13 +187,13 @@ pub fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.SubscribeO
     var pos = PROPERTIES_OFFSET + properties_len;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic.filter);
-        var subscription_options = SubscriptionOptions{
+        const subscription_options = SubscriptionOptions{
             .qos = topic.qos,
             .no_local = topic.no_local,
             .retain_as_published = topic.retain_as_published,
             .retain_handling = topic.retain_handling,
         };
-        buf[pos] = @as([*]u8, @ptrCast(@alignCast(&subscription_options)))[0];
+        buf[pos] = @bitCast(subscription_options);
         pos += 1;
     }
 
@@ -216,7 +216,7 @@ pub fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.Unsubscr
 }
 
 pub fn encodePublish(buf: []u8, packet_identifier: ?u16, opts: mqttz.PublishOpts) ![]u8 {
-    var publish_flags = PublishFlags{
+    const publish_flags = PublishFlags{
         .dup = opts.dup,
         .qos = opts.qos,
         .retain = opts.retain,
@@ -243,7 +243,7 @@ pub fn encodePublish(buf: []u8, packet_identifier: ?u16, opts: mqttz.PublishOpts
         return error.WriteBufferIsFull;
     }
     @memcpy(buf[payload_offset..end], message);
-    return encodePacketHeader(buf[0..end], 3, @as([*]u4, @ptrCast(@alignCast(&publish_flags)))[0]);
+    return encodePacketHeader(buf[0..end], 3, @as(u4, @bitCast(publish_flags)));
 }
 
 pub fn encodePubAck(buf: []u8, opts: mqttz.PubAckOpts) ![]u8 {
