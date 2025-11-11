@@ -6,11 +6,12 @@ const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
-pub const Client = struct {
-    // our posix client is a wrapper around the platform-agnostic mqttz.Mqtt client
-    // we'll provide  read, write and close implementations (based around std.posix)
-    // as well as other higher level functionality.
-    mqtt: mqttz.Mqtt(Client),
+pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
+    return struct {
+        // our posix client is a wrapper around the platform-agnostic mqttz.Mqtt client
+        // we'll provide  read, write and close implementations (based around std.posix)
+        // as well as other higher level functionality.
+        mqtt: mqttz.Mqtt(@This(), protocol_version),
 
     // Our own wrapper around std.net.Address. Handles connect timeout and can
     // pickup DNS changes on reconnect.
@@ -333,7 +334,8 @@ pub const Client = struct {
             return socket;
         }
     };
-};
+    };
+}
 
 // Wraps a std.net.Address so that
 // (a) we can handle the fact that host DNS can change and can have multiple IPs
@@ -675,9 +677,9 @@ const TestConn = struct {
     }
 };
 
-fn testClient(opts: anytype) Client {
+fn testClient(opts: anytype) Client(.mqtt_5_0) {
     _ = opts; // not currently used
-    return Client.init(.{
+    return Client(.mqtt_5_0).init(.{
         .port = 6588,
         .ip = "127.0.0.1",
         .allocator = t.allocator,

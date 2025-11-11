@@ -100,7 +100,7 @@ pub fn readString(buf: []const u8) error{InvalidString}!struct { []const u8, usi
     return .{ buf[2..end], end };
 }
 
-pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
+pub fn encodeConnect(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.ConnectOpts) ![]u8 {
     var connect_flags = packed struct(u8) {
         _reserved: bool = false,
         clean_start: bool = true,
@@ -129,7 +129,7 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     buf[9] = 'T';
     buf[10] = 'T';
 
-    buf[11] = @intFromEnum(opts.protocol_version);
+    buf[11] = @intFromEnum(protocol_version);
 
     buf[12] = @bitCast(connect_flags);
 
@@ -138,7 +138,7 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     // everything above is safe, since buf is at least MIN_BUF_SIZE.
 
     const PROPERTIES_OFFSET = 15;
-    const properties_len = if (opts.protocol_version == .mqtt_5_0)
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
         try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.CONNECT)
     else
         0; // MQTT 3.1.1 has no properties
@@ -148,7 +148,7 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     pos += try writeString(buf[pos..], opts.client_id orelse "");
 
     if (opts.will) |will| {
-        pos += if (opts.protocol_version == .mqtt_5_0)
+        pos += if (comptime protocol_version == .mqtt_5_0)
             try properties.write(buf[pos..], will, &properties.WILL)
         else
             0; // MQTT 3.1.1 has no will properties
@@ -166,9 +166,9 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     return encodePacketHeader(buf[0..pos], 1, 0);
 }
 
-pub fn encodeDisconnect(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mqttz.DisconnectOpts) ![]u8 {
+pub fn encodeDisconnect(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.DisconnectOpts) ![]u8 {
     // In MQTT 3.1.1, DISCONNECT has no variable header (only fixed header)
-    if (protocol_version == .mqtt_3_1_1) {
+    if (comptime protocol_version == .mqtt_3_1_1) {
         return encodePacketHeader(buf[0..5], 14, 0);
     }
 
@@ -182,7 +182,7 @@ pub fn encodeDisconnect(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 14, 0);
 }
 
-pub fn encodeSubscribe(buf: []u8, protocol_version: mqttz.ProtocolVersion, packet_identifier: u16, opts: mqttz.SubscribeOpts) ![]u8 {
+pub fn encodeSubscribe(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, packet_identifier: u16, opts: mqttz.SubscribeOpts) ![]u8 {
     const SubscriptionOptions = packed struct(u8) {
         qos: mqttz.QoS,
         no_local: bool,
@@ -196,7 +196,7 @@ pub fn encodeSubscribe(buf: []u8, protocol_version: mqttz.ProtocolVersion, packe
 
     writeInt(u16, buf[5..7], packet_identifier);
     const PROPERTIES_OFFSET = 7;
-    const properties_len = if (protocol_version == .mqtt_5_0)
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
         try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.SUBSCRIBE)
     else
         0; // MQTT 3.1.1 has no properties
@@ -204,7 +204,7 @@ pub fn encodeSubscribe(buf: []u8, protocol_version: mqttz.ProtocolVersion, packe
     var pos = PROPERTIES_OFFSET + properties_len;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic.filter);
-        if (protocol_version == .mqtt_5_0) {
+        if (comptime protocol_version == .mqtt_5_0) {
             const subscription_options = SubscriptionOptions{
                 .qos = topic.qos,
                 .no_local = topic.no_local,
@@ -223,12 +223,12 @@ pub fn encodeSubscribe(buf: []u8, protocol_version: mqttz.ProtocolVersion, packe
     return encodePacketHeader(buf[0..pos], 8, 2);
 }
 
-pub fn encodeUnsubscribe(buf: []u8, protocol_version: mqttz.ProtocolVersion, packet_identifier: u16, opts: mqttz.UnsubscribeOpts) ![]u8 {
+pub fn encodeUnsubscribe(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, packet_identifier: u16, opts: mqttz.UnsubscribeOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], packet_identifier);
     const PROPERTIES_OFFSET = 7;
-    const properties_len = if (protocol_version == .mqtt_5_0)
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
         try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.UNSUBSCRIBE)
     else
         0; // MQTT 3.1.1 has no properties
@@ -241,7 +241,7 @@ pub fn encodeUnsubscribe(buf: []u8, protocol_version: mqttz.ProtocolVersion, pac
     return encodePacketHeader(buf[0..pos], 10, 2);
 }
 
-pub fn encodePublish(buf: []u8, protocol_version: mqttz.ProtocolVersion, packet_identifier: ?u16, opts: mqttz.PublishOpts) ![]u8 {
+pub fn encodePublish(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, packet_identifier: ?u16, opts: mqttz.PublishOpts) ![]u8 {
     const publish_flags = PublishFlags{
         .dup = opts.dup,
         .qos = opts.qos,
@@ -260,7 +260,7 @@ pub fn encodePublish(buf: []u8, protocol_version: mqttz.ProtocolVersion, packet_
         writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], pi);
     }
 
-    const properties_len = if (protocol_version == .mqtt_5_0)
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
         try properties.write(buf[properties_offset..], opts, &properties.PUBLISH)
     else
         0; // MQTT 3.1.1 has no properties
@@ -275,13 +275,13 @@ pub fn encodePublish(buf: []u8, protocol_version: mqttz.ProtocolVersion, packet_
     return encodePacketHeader(buf[0..end], 3, @as(u4, @bitCast(publish_flags)));
 }
 
-pub fn encodePubAck(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubAckOpts) ![]u8 {
+pub fn encodePubAck(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubAckOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
 
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    if (protocol_version == .mqtt_3_1_1) {
+    if (comptime protocol_version == .mqtt_3_1_1) {
         buf[3] = 64; // packet type (0100) + flags (0000)
         buf[4] = 2; // remaining length
         return buf[3..7];
@@ -304,13 +304,13 @@ pub fn encodePubAck(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mq
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 4, 0);
 }
 
-pub fn encodePubRec(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubRecOpts) ![]u8 {
+pub fn encodePubRec(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubRecOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
 
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    if (protocol_version == .mqtt_3_1_1) {
+    if (comptime protocol_version == .mqtt_3_1_1) {
         buf[3] = 80; // packet type (0101) + flags (0000)
         buf[4] = 2; // remaining length
         return buf[3..7];
@@ -333,13 +333,13 @@ pub fn encodePubRec(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mq
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 5, 0);
 }
 
-pub fn encodePubRel(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubRelOpts) ![]u8 {
+pub fn encodePubRel(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubRelOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
 
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    if (protocol_version == .mqtt_3_1_1) {
+    if (comptime protocol_version == .mqtt_3_1_1) {
         buf[3] = 98; // packet type (0110) + flags (0010)
         buf[4] = 2; // remaining length
         return buf[3..7];
@@ -362,13 +362,13 @@ pub fn encodePubRel(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mq
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 6, 2);
 }
 
-pub fn encodePubComp(buf: []u8, protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubCompOpts) ![]u8 {
+pub fn encodePubComp(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubCompOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
 
     // MQTT 3.1.1: only packet identifier (2 bytes)
-    if (protocol_version == .mqtt_3_1_1) {
+    if (comptime protocol_version == .mqtt_3_1_1) {
         buf[3] = 112; // packet type (0111) + flags (0000)
         buf[4] = 2; // remaining length
         return buf[3..7];
