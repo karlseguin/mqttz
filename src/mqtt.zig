@@ -218,6 +218,12 @@ pub const ErrorDetail = union(enum) {
     reason: ErrorReasonCode,
 };
 
+pub fn Mqtt5(comptime T: type) type {
+    return Mqtt(T, .mqtt_5_0);
+}
+pub fn Mqtt311(comptime T: type) type {
+    return Mqtt(T, .mqtt_3_1_1);
+}
 pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
     return struct {
         // buffer used for reading messages from the server. If a single message
@@ -1522,7 +1528,7 @@ test "Client: connect" {
         } });
         try ctx.expectWritten(1, &.{
             16, // packet type
-            142, 1, // payload length
+            166, 1, // payload length
             0, 4, 'M', 'Q', 'T', 'T', // protocol name
             5, // protocol version
             246, // connect flags (1, 1, 1, 1, 0, 1, 1, 0)
@@ -1563,6 +1569,10 @@ test "Client: connect" {
             0x09, 0x00, 0x0B, 'o',  'v',
             'e',  'r',  ' ',  '9',  '0',
             '0',  '0',  '!',  '!',
+            0, 9,   // topic length,
+            't', 'h', 'e', ' ', 't', 'o', 'p', 'i', 'c',
+            0, 11,   // message length,
+            't', 'h', 'e', ' ', 'm', 'e', 's', 's', 'a', 'g', 'e',
             0,   12, // username length
             't', 'h',
             'e', '-',
@@ -2697,7 +2707,7 @@ const TestContext = struct {
     write_count: usize,
     close_count: usize,
     _random: ?std.Random.DefaultPrng = null,
-    client: Mqtt(TestContext),
+    client: Mqtt5(TestContext),
 
     const std = @import("std");
 
@@ -2717,7 +2727,7 @@ const TestContext = struct {
             .written = .empty,
             .write_count = 0,
             .close_count = 0,
-            .client = Mqtt(TestContext).init(read_buf, write_buf),
+            .client = Mqtt5(TestContext).init(read_buf, write_buf),
         };
     }
 
