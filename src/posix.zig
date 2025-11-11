@@ -6,6 +6,10 @@ const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
+pub const Client5 = Client(.mqtt_5_0);
+pub const Client311 = Client(.{ .mqtt_3_1_1 = true });
+pub const Client311NoCheck = Client(.{ .mqtt_3_1_1 = false });
+
 pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
     return struct {
         // our posix client is a wrapper around the platform-agnostic mqttz.Mqtt client
@@ -13,327 +17,329 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
         // as well as other higher level functionality.
         mqtt: mqttz.Mqtt(@This(), protocol_version),
 
-    // Our own wrapper around std.net.Address. Handles connect timeout and can
-    // pickup DNS changes on reconnect.
-    address: Address,
+        // Our own wrapper around std.net.Address. Handles connect timeout and can
+        // pickup DNS changes on reconnect.
+        address: Address,
 
-    // if we own the read_buffer, it's our job to free it on deinit
-    read_buf_own: bool,
+        // if we own the read_buffer, it's our job to free it on deinit
+        read_buf_own: bool,
 
-    // if we own the write_buffer, it's our job to free it on deinit
-    write_buf_own: bool,
+        // if we own the write_buffer, it's our job to free it on deinit
+        write_buf_own: bool,
 
-    allocator: ?Allocator,
+        allocator: ?Allocator,
 
-    connect_timeout: i32,
+        connect_timeout: i32,
 
-    // set when connect is called, can be unset on error (indicating that we need
-    // to reconnect)
-    socket: ?posix.socket_t,
+        // set when connect is called, can be unset on error (indicating that we need
+        // to reconnect)
+        socket: ?posix.socket_t,
 
-    default_retries: u16,
-    default_timeout: i32,
+        default_retries: u16,
+        default_timeout: i32,
 
-    pub const Opts = struct {
-        port: u16,
+        pub const Opts = struct {
+            port: u16,
 
-        // either ip or host must be provided
-        ip: ?[]const u8 = null,
-        host: ?[]const u8 = null,
+            // either ip or host must be provided
+            ip: ?[]const u8 = null,
+            host: ?[]const u8 = null,
 
-        connect_timeout: i32 = 10_000,
-        default_retries: ?u16 = null,
-        default_timeout: ?i32 = null,
+            connect_timeout: i32 = 10_000,
+            default_retries: ?u16 = null,
+            default_timeout: ?i32 = null,
 
-        // required if host != null OR read_buffer == null OR write_buffer == null
-        allocator: ?Allocator = null,
+            // required if host != null OR read_buffer == null OR write_buffer == null
+            allocator: ?Allocator = null,
 
-        // if null, we'll use allocator to create a buffer of read_buffer_size
-        read_buf: ?[]u8 = null,
-        read_buf_size: u16 = 8192,
+            // if null, we'll use allocator to create a buffer of read_buffer_size
+            read_buf: ?[]u8 = null,
+            read_buf_size: u16 = 8192,
 
-        // if null, we'll use allocator to create a buffer of read_buffer_size
-        write_buf: ?[]u8 = null,
-        write_buf_size: u16 = 8192,
-    };
-
-    const ReadWriteOpts = struct {
-        retries: ?u16 = null,
-        timeout: ?i32 = null,
-    };
-
-    pub fn init(opts: Opts) !Client {
-        const allocator = opts.allocator;
-
-        if (allocator == null and (opts.ip == null or opts.read_buf == null or opts.write_buf == null)) {
-            return error.AllocatorRequired;
-        }
-
-        var read_buf_own = false;
-        var read_buf = opts.read_buf;
-        if (read_buf == null) {
-            read_buf_own = true;
-            read_buf = try allocator.?.alloc(u8, opts.read_buf_size);
-        }
-        errdefer if (read_buf_own) allocator.?.free(read_buf.?);
-
-        var write_buf_own = false;
-        var write_buf = opts.write_buf;
-        if (write_buf == null) {
-            write_buf_own = true;
-            write_buf = try allocator.?.alloc(u8, opts.write_buf_size);
-        }
-        errdefer if (write_buf_own) allocator.?.free(write_buf.?);
-
-        const address = try Address.init(opts.host, opts.ip, opts.port);
-
-        return .{
-            .socket = null,
-            .address = address,
-            .allocator = allocator,
-            .read_buf_own = read_buf_own,
-            .write_buf_own = write_buf_own,
-            .connect_timeout = opts.connect_timeout,
-            .default_retries = opts.default_retries orelse 1,
-            .default_timeout = opts.default_timeout orelse 5_000,
-            .mqtt = mqttz.Mqtt(Client).init(read_buf.?, write_buf.?),
-        };
-    }
-
-    pub fn deinit(self: *Client) void {
-        self.close();
-
-        const allocator = self.allocator;
-        if (self.read_buf_own) {
-            allocator.?.free(self.mqtt.read_buf);
-        }
-
-        if (self.write_buf_own) {
-            allocator.?.free(self.mqtt.write_buf);
-        }
-    }
-
-    pub fn lastError(self: *const Client) ?mqttz.ErrorDetail {
-        return self.mqtt.last_error;
-    }
-
-    pub fn lastReadPacket(self: *const Client) []const u8 {
-        return self.mqtt.lastReadPacket();
-    }
-
-    pub fn connect(self: *Client, rw: ReadWriteOpts, opts: mqttz.ConnectOpts) !void {
-        try self.mqtt.connect(&self.createContext(rw), opts);
-    }
-
-    pub fn publish(self: *Client, rw: ReadWriteOpts, opts: mqttz.PublishOpts) !?u16 {
-        return self.mqtt.publish(&self.createContext(rw), opts);
-    }
-
-    pub fn subscribe(self: *Client, rw: ReadWriteOpts, opts: mqttz.SubscribeOpts) !u16 {
-        return self.mqtt.subscribe(&self.createContext(rw), opts);
-    }
-
-    pub fn unsubscribe(self: *Client, rw: ReadWriteOpts, opts: mqttz.UnsubscribeOpts) !u16 {
-        return self.mqtt.unsubscribe(&self.createContext(rw), opts);
-    }
-
-    pub fn puback(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubAckOpts) !void {
-        return self.mqtt.puback(&self.createContext(rw), opts);
-    }
-
-    pub fn pubrec(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubRecOpts) !void {
-        return self.mqtt.pubrec(&self.createContext(rw), opts);
-    }
-
-    pub fn pubrel(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubRelOpts) !void {
-        return self.mqtt.pubrel(&self.createContext(rw), opts);
-    }
-
-    pub fn pubcomp(self: *Client, rw: ReadWriteOpts, opts: mqttz.PubCompOpts) !void {
-        return self.mqtt.pubcomp(&self.createContext(rw), opts);
-    }
-
-    pub fn ping(self: *Client, rw: ReadWriteOpts) !void {
-        return self.mqtt.ping(
-            &self.createContext(rw),
-        );
-    }
-
-    pub fn disconnect(self: *Client, rw: ReadWriteOpts, opts: mqttz.DisconnectOpts) !void {
-        if (self.socket == null) {
-            return;
-        }
-
-        // copy so we can mutate
-        var rw_copy = rw;
-        if (rw.retries == null) {
-            // unless a retry is explicit set, let's override the default, since we
-            // don't want to reconnect just to disconnect.
-            rw_copy.retries = 0;
-        }
-        return self.mqtt.disconnect(&self.createContext(rw_copy), opts);
-    }
-
-    pub fn readPacket(self: *Client, rw: ReadWriteOpts) !?mqttz.Packet {
-        return self.mqtt.readPacket(&self.createContext(rw));
-    }
-
-    fn getOrConnectSocket(self: *Client) !posix.socket_t {
-        return self.socket orelse {
-            const socket = try self.address.connect(self.allocator, self.connect_timeout);
-            self.socket = socket;
-            return socket;
-        };
-    }
-
-    fn close(self: *Client) void {
-        if (self.socket) |socket| {
-            posix.close(socket);
-            self.socket = null;
-        }
-    }
-
-    fn createContext(self: *Client, rw: ReadWriteOpts) MqttPlatform.Context {
-        return .{
-            .client = self,
-            .retries = rw.retries orelse self.default_retries,
-            .timeout = rw.timeout orelse self.default_timeout,
-        };
-    }
-
-    pub const MqttPlatform = struct {
-        const Context = struct {
-            client: *Client,
-            retries: u16 = 1,
-            timeout: i32 = 10_000,
+            // if null, we'll use allocator to create a buffer of read_buffer_size
+            write_buf: ?[]u8 = null,
+            write_buf_size: u16 = 8192,
         };
 
-        // Called by our composed mqtt.Client
-        pub fn read(ctx: *const Context, buf: []u8, _: usize) !?usize {
-            var client = ctx.client;
+        const ReadWriteOpts = struct {
+            retries: ?u16 = null,
+            timeout: ?i32 = null,
+        };
 
-            const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
+        const Self = @This();
 
-            // on disconnect, the number of times that we'll try to reconnect and
-            // continue. This counts downwards to 0.
-            var retries = ctx.retries;
+        pub fn init(opts: Opts) !Self {
+            const allocator = opts.allocator;
 
-            // If retries > 0 and we detect a disconnect, we'll attempt to reload the
-            // socket (hence socket is var, not const).
-            var socket = try client.getOrConnectSocket();
-            loop: while (true) {
-                const n = posix.read(socket, buf) catch |err| {
-                    switch (err) {
-                        error.BrokenPipe, error.ConnectionResetByPeer => {
-                            socket = try handleError(client, &retries);
-                            continue :loop;
-                        },
+            if (allocator == null and (opts.ip == null or opts.read_buf == null or opts.write_buf == null)) {
+                return error.AllocatorRequired;
+            }
+
+            var read_buf_own = false;
+            var read_buf = opts.read_buf;
+            if (read_buf == null) {
+                read_buf_own = true;
+                read_buf = try allocator.?.alloc(u8, opts.read_buf_size);
+            }
+            errdefer if (read_buf_own) allocator.?.free(read_buf.?);
+
+            var write_buf_own = false;
+            var write_buf = opts.write_buf;
+            if (write_buf == null) {
+                write_buf_own = true;
+                write_buf = try allocator.?.alloc(u8, opts.write_buf_size);
+            }
+            errdefer if (write_buf_own) allocator.?.free(write_buf.?);
+
+            const address = try Address.init(opts.host, opts.ip, opts.port);
+
+            return .{
+                .socket = null,
+                .address = address,
+                .allocator = allocator,
+                .read_buf_own = read_buf_own,
+                .write_buf_own = write_buf_own,
+                .connect_timeout = opts.connect_timeout,
+                .default_retries = opts.default_retries orelse 1,
+                .default_timeout = opts.default_timeout orelse 5_000,
+                .mqtt = mqttz.Mqtt(Self, protocol_version).init(read_buf.?, write_buf.?),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.close();
+
+            const allocator = self.allocator;
+            if (self.read_buf_own) {
+                allocator.?.free(self.mqtt.read_buf);
+            }
+
+            if (self.write_buf_own) {
+                allocator.?.free(self.mqtt.write_buf);
+            }
+        }
+
+        pub fn lastError(self: *const Self) ?mqttz.ErrorDetail {
+            return self.mqtt.last_error;
+        }
+
+        pub fn lastReadPacket(self: *const Self) []const u8 {
+            return self.mqtt.lastReadPacket();
+        }
+
+        pub fn connect(self: *Self, rw: ReadWriteOpts, opts: mqttz.ConnectOpts) !void {
+            try self.mqtt.connect(&self.createContext(rw), opts);
+        }
+
+        pub fn publish(self: *Self, rw: ReadWriteOpts, opts: mqttz.PublishOpts) !?u16 {
+            return self.mqtt.publish(&self.createContext(rw), opts);
+        }
+
+        pub fn subscribe(self: *Self, rw: ReadWriteOpts, opts: mqttz.SubscribeOpts) !u16 {
+            return self.mqtt.subscribe(&self.createContext(rw), opts);
+        }
+
+        pub fn unsubscribe(self: *Self, rw: ReadWriteOpts, opts: mqttz.UnsubscribeOpts) !u16 {
+            return self.mqtt.unsubscribe(&self.createContext(rw), opts);
+        }
+
+        pub fn puback(self: *Self, rw: ReadWriteOpts, opts: mqttz.PubAckOpts) !void {
+            return self.mqtt.puback(&self.createContext(rw), opts);
+        }
+
+        pub fn pubrec(self: *Self, rw: ReadWriteOpts, opts: mqttz.PubRecOpts) !void {
+            return self.mqtt.pubrec(&self.createContext(rw), opts);
+        }
+
+        pub fn pubrel(self: *Self, rw: ReadWriteOpts, opts: mqttz.PubRelOpts) !void {
+            return self.mqtt.pubrel(&self.createContext(rw), opts);
+        }
+
+        pub fn pubcomp(self: *Self, rw: ReadWriteOpts, opts: mqttz.PubCompOpts) !void {
+            return self.mqtt.pubcomp(&self.createContext(rw), opts);
+        }
+
+        pub fn ping(self: *Self, rw: ReadWriteOpts) !void {
+            return self.mqtt.ping(
+                &self.createContext(rw),
+            );
+        }
+
+        pub fn disconnect(self: *Self, rw: ReadWriteOpts, opts: mqttz.DisconnectOpts) !void {
+            if (self.socket == null) {
+                return;
+            }
+
+            // copy so we can mutate
+            var rw_copy = rw;
+            if (rw.retries == null) {
+                // unless a retry is explicit set, let's override the default, since we
+                // don't want to reconnect just to disconnect.
+                rw_copy.retries = 0;
+            }
+            return self.mqtt.disconnect(&self.createContext(rw_copy), opts);
+        }
+
+        pub fn readPacket(self: *Self, rw: ReadWriteOpts) !?mqttz.Packet {
+            return self.mqtt.readPacket(&self.createContext(rw));
+        }
+
+        fn getOrConnectSocket(self: *Self) !posix.socket_t {
+            return self.socket orelse {
+                const socket = try self.address.connect(self.allocator, self.connect_timeout);
+                self.socket = socket;
+                return socket;
+            };
+        }
+
+        fn close(self: *Self) void {
+            if (self.socket) |socket| {
+                posix.close(socket);
+                self.socket = null;
+            }
+        }
+
+        fn createContext(self: *Self, rw: ReadWriteOpts) MqttPlatform.Context {
+            return .{
+                .client = self,
+                .retries = rw.retries orelse self.default_retries,
+                .timeout = rw.timeout orelse self.default_timeout,
+            };
+        }
+
+        pub const MqttPlatform = struct {
+            const Context = struct {
+                client: *Self,
+                retries: u16 = 1,
+                timeout: i32 = 10_000,
+            };
+
+            // Called by our composed mqtt.Client(T)
+            pub fn read(ctx: *const Context, buf: []u8, _: usize) !?usize {
+                var client = ctx.client;
+
+                const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
+
+                // on disconnect, the number of times that we'll try to reconnect and
+                // continue. This counts downwards to 0.
+                var retries = ctx.retries;
+
+                // If retries > 0 and we detect a disconnect, we'll attempt to reload the
+                // socket (hence socket is var, not const).
+                var socket = try client.getOrConnectSocket();
+                loop: while (true) {
+                    const n = posix.read(socket, buf) catch |err| {
+                        switch (err) {
+                            error.BrokenPipe, error.ConnectionResetByPeer => {
+                                socket = try handleError(client, &retries);
+                                continue :loop;
+                            },
+                            error.WouldBlock => {
+                                const timeout: i32 = @intCast(absolute_timeout - std.time.milliTimestamp());
+                                if (timeout < 0) {
+                                    return null;
+                                }
+
+                                var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.IN, .revents = 0 }};
+                                if (try posix.poll(&fds, timeout) == 0) {
+                                    return null;
+                                }
+
+                                if (fds[0].revents & posix.POLL.IN != posix.POLL.IN) {
+                                    // handle any other non-POLLOUT event as an error
+                                    socket = try handleError(client, &retries);
+                                }
+
+                                // Either poll has told us we can read without blocking OR
+                                // poll told us there was a error, but retries > 0 and we managed
+                                // to reconnect. Either way, we're gonna try to read again.
+                                continue :loop;
+                            },
+                            else => {
+                                client.close();
+                                return err;
+                            },
+                        }
+                    };
+
+                    if (n != 0) {
+                        return n;
+                    }
+
+                    socket = try handleError(client, &retries);
+                }
+            }
+
+            // Called by our composed mqtt.Client
+            pub fn write(ctx: *const Context, data: []const u8) !void {
+                var client = ctx.client;
+
+                const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
+
+                // on disconnect, the number of times that we'll try to reconnect and
+                // continue. This counts downwards to 0.
+                var retries = ctx.retries;
+
+                // If retries > 0 and we detect a disconnect, we'll attempt to reload the
+                // socket (hence socket is var, not const).
+                var socket = try client.getOrConnectSocket();
+
+                // position in data that we've written to so far (or, put differently,
+                // positition in data that our next write starts at)
+                var pos: usize = 0;
+
+                loop: while (pos < data.len) {
+                    pos += posix.write(socket, data[pos..]) catch |err| switch (err) {
                         error.WouldBlock => {
-                            const timeout: i32 = @intCast(absolute_timeout - std.time.milliTimestamp());
+                            const timeout: i32 = @intCast(std.time.milliTimestamp() - absolute_timeout);
                             if (timeout < 0) {
-                                return null;
+                                return error.Timeout;
                             }
 
-                            var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.IN, .revents = 0 }};
+                            var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.OUT, .revents = 0 }};
                             if (try posix.poll(&fds, timeout) == 0) {
-                                return null;
+                                return error.Timeout;
                             }
 
-                            if (fds[0].revents & posix.POLL.IN != posix.POLL.IN) {
+                            const revents = fds[0].revents;
+                            if (revents & posix.POLL.OUT != posix.POLL.OUT) {
                                 // handle any other non-POLLOUT event as an error
                                 socket = try handleError(client, &retries);
                             }
 
-                            // Either poll has told us we can read without blocking OR
+                            // Either poll has told us we can write without blocking OR
                             // poll told us there was a error, but retries > 0 and we managed
-                            // to reconnect. Either way, we're gonna try to read again.
+                            // to reconnect. Either way, we're gonna try to write again.
+                            continue :loop;
+                        },
+                        error.BrokenPipe, error.ConnectionResetByPeer => {
+                            socket = try handleError(client, &retries);
                             continue :loop;
                         },
                         else => {
                             client.close();
                             return err;
                         },
-                    }
-                };
-
-                if (n != 0) {
-                    return n;
+                    };
                 }
-
-                socket = try handleError(client, &retries);
             }
-        }
 
-        // Called by our composed mqtt.Client
-        pub fn write(ctx: *const Context, data: []const u8) !void {
-            var client = ctx.client;
-
-            const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
-
-            // on disconnect, the number of times that we'll try to reconnect and
-            // continue. This counts downwards to 0.
-            var retries = ctx.retries;
-
-            // If retries > 0 and we detect a disconnect, we'll attempt to reload the
-            // socket (hence socket is var, not const).
-            var socket = try client.getOrConnectSocket();
-
-            // position in data that we've written to so far (or, put differently,
-            // positition in data that our next write starts at)
-            var pos: usize = 0;
-
-            loop: while (pos < data.len) {
-                pos += posix.write(socket, data[pos..]) catch |err| switch (err) {
-                    error.WouldBlock => {
-                        const timeout: i32 = @intCast(std.time.milliTimestamp() - absolute_timeout);
-                        if (timeout < 0) {
-                            return error.Timeout;
-                        }
-
-                        var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.OUT, .revents = 0 }};
-                        if (try posix.poll(&fds, timeout) == 0) {
-                            return error.Timeout;
-                        }
-
-                        const revents = fds[0].revents;
-                        if (revents & posix.POLL.OUT != posix.POLL.OUT) {
-                            // handle any other non-POLLOUT event as an error
-                            socket = try handleError(client, &retries);
-                        }
-
-                        // Either poll has told us we can write without blocking OR
-                        // poll told us there was a error, but retries > 0 and we managed
-                        // to reconnect. Either way, we're gonna try to write again.
-                        continue :loop;
-                    },
-                    error.BrokenPipe, error.ConnectionResetByPeer => {
-                        socket = try handleError(client, &retries);
-                        continue :loop;
-                    },
-                    else => {
-                        client.close();
-                        return err;
-                    },
-                };
+            // Called by our composed mqtt.Client
+            pub fn close(ctx: *const Context) void {
+                ctx.client.close();
             }
-        }
 
-        // Called by our composed mqtt.Client
-        pub fn close(ctx: *const Context) void {
-            ctx.client.close();
-        }
-
-        fn handleError(client: *Client, retries: *u16) !posix.socket_t {
-            client.close();
-            const r = retries.*;
-            if (r == 0) {
-                return error.Closed;
+            fn handleError(client: *Self, retries: *u16) !posix.socket_t {
+                client.close();
+                const r = retries.*;
+                if (r == 0) {
+                    return error.Closed;
+                }
+                const socket = try client.getOrConnectSocket();
+                retries.* = r - 1;
+                return socket;
             }
-            const socket = try client.getOrConnectSocket();
-            retries.* = r - 1;
-            return socket;
-        }
-    };
+        };
     };
 }
 

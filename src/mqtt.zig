@@ -246,14 +246,14 @@ pub const ErrorDetail = union(enum) {
 pub fn Mqtt5(comptime T: type) type {
     return Mqtt(T, .mqtt_5_0);
 }
-
 pub fn Mqtt311(comptime T: type) type {
+    return Mqtt(T, .{ .mqtt_3_1_1 = true });
+}
+pub fn Mqtt311NoCheck(comptime T: type) type {
     return Mqtt(T, .{ .mqtt_3_1_1 = false });
 }
 
-pub fn Mqtt311Strict(comptime T: type) type {
-    return Mqtt(T, .{ .mqtt_3_1_1 = true });
-}
+
 pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
     return struct {
         // buffer used for reading messages from the server. If a single message
@@ -324,7 +324,7 @@ pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
             return PartialPacket.decode(buf[0], buf[fixed_header_len..@min(total_len, buf.len)]);
         }
 
-        const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).@"fn".return_type.?).error_union.error_set;
+        const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).@"fn".return_type.?).error_union.error_set || error{UnsupportedPropertyForMqtt311};
 
         pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) (WriteError || error{WriteBufferIsFull})!void {
             const connect_packet = try codec.encodeConnect(self.write_buf, protocol_version, opts);
@@ -402,7 +402,7 @@ pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
             try self.writePacket(state, &.{ 192, 0 });
         }
 
-        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull})!void {
+        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull,})!void {
             defer T.MqttPlatform.close(state);
             const disconnect_packet = try codec.encodeDisconnect(self.write_buf, protocol_version, opts);
             return self.writePacket(state, disconnect_packet);
@@ -1112,7 +1112,7 @@ fn decodePublish(data: []u8, flags: u4, comptime protocol_version: ProtocolVersi
         return error.IncompletePacket;
     }
 
-    const publish_flags: *codec.PublishFlags = @constCast(@ptrCast(&flags));
+    const publish_flags: *codec.PublishFlags = @ptrCast(@constCast(&flags));
 
     const topic, var message_offset = try codec.readString(data);
     var publish = Packet.Publish{
@@ -1164,7 +1164,7 @@ fn decodePartialPublish(data: []const u8, flags: u4) ?PartialPacket.Publish {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    const publish_flags: *codec.PublishFlags = @constCast(@ptrCast(&flags));
+    const publish_flags: *codec.PublishFlags = @ptrCast(@constCast(&flags));
 
     const topic, var properties_offset = codec.readString(data) catch {
         return null;
@@ -1599,10 +1599,19 @@ test "Client: connect" {
             0x09, 0x00, 0x0B, 'o',  'v',
             'e',  'r',  ' ',  '9',  '0',
             '0',  '0',  '!',  '!',
-            0, 9,   // topic length,
-            't', 'h', 'e', ' ', 't', 'o', 'p', 'i', 'c',
-            0, 11,   // message length,
-            't', 'h', 'e', ' ', 'm', 'e', 's', 's', 'a', 'g', 'e',
+            0,   9, // topic length,
+            't', 'h',
+            'e', ' ',
+            't', 'o',
+            'p', 'i',
+            'c',
+            0,   11, // message length,
+            't', 'h',
+            'e', ' ',
+            'm', 'e',
+            's', 's',
+            'a', 'g',
+            'e',
             0,   12, // username length
             't', 'h',
             'e', '-',

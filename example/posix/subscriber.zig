@@ -9,7 +9,7 @@ pub fn main() !void {
 	const allocator = gpa.allocator();
 	defer _ = gpa.detectLeaks();
 
-	var client = try mqttz.posix.Client.init(.{
+	var client = try mqttz.posix.Client5.init(.{
 		.port = 1883,
 		.host = "test.mosquitto.org",
 		// It IS possible to use the posix client without an allocator, see readme

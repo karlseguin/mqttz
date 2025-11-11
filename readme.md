@@ -5,7 +5,7 @@ This is a embedding-friendly MQTT client library for Zig. The library has two cl
 ## Examples
 These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
 
-The `example` folder contains examples of using both clients. The low-level client is implemented using Zig's standard library. This implementation is very basic and not as feature rich as `mqtt.posix.Client` (i.e. no timeouts) . It is only included to show how to integrate the low-level client within your own platform.
+The `example` folder contains examples of using both clients. The low-level client is implemented using Zig's standard library. This implementation is very basic and not as feature rich as `mqtt.posix.Client5` (i.e. no timeouts) . It is only included to show how to integrate the low-level client within your own platform.
 
 To run the low-level clients:
 Start the subscriber via: `zig build example_low_level_subscriber`. 
@@ -30,13 +30,20 @@ This generally means that you need to call `readPacket` in a loop (until you get
 
 See the examples in the `example` folder.
 
-## mqtt.posix.Client
-`mqtt.posix.Client` is a higher level library that uses Zig's standard library and should be the preferred client to use if Zig's standard library is available.
+## MQTT Version
+The library supports both MQTT 5 and MQTT 3.1.1. This readme and the examples use the `Mqtt5(T)` generic which is the MQTT 5.0 driver. Use `Mqtt311(T)` instead for MQTT 3.1.1 support.
+
+By default `Mqtt311(T)` will return an error if a 5.0 option is used which is not supported by 3.1.1. To avoid this runtime check, use `Mqtt311NoCheck(T)` instead. This is a good option if you want forward compatibility with 5.0 or understand the risks [of having parameters silently] ignored and want to avoid the runtime checks.
+
+Similarly, there's a `Client5`, `Client311` and `ClientNoCheck`.
+
+## mqtt.posix.Client5
+`mqtt.posix.Client5` is a higher level library that uses Zig's standard library and should be the preferred client to use if Zig's standard library is available.
 
 The client supports timeouts and automatic reconnects. It can optionally be configured without an allocator.
 
 ### ReadWriteOpts
-All methods are thin wrappers around the lower-level `mqtt.Mqtt(t)`. However, an additional optional parameter has been added (Zig doesn't make composing options easy, so I opted for just adding another parameter - sorry!).
+All methods are thin wrappers around the lower-level `mqtt.Mqtt5(t)`. However, an additional optional parameter has been added (Zig doesn't make composing options easy, so I opted for just adding another parameter - sorry!).
 
 Where the low-level signature is `publish(opts: SubscribeOpts)` the higher-level signature is: `publish(rw: ReadWriteOpts, opts: SubscribeOpts)`. `ReadWriteOpts` allows overriding the default `retries` and `timeout`.
 
@@ -54,7 +61,7 @@ If a timeout is reached when writing a packet, `error.Timeout` will be returned.
 
 The client will automatically attempt to reconnect and continue the operation when `retries > 0`. When `retries` reaches 0, the underlying error is returned. At this point, the `client` can still be used as any subsequent write/reads will automatically attempt to reconnect.
 
-### init(opts: Client.Opts) !Client
+### init(opts: Client5.Opts) !Client5
 Initializes the client. This does not open a TCP connection to the server. 
 
 Options are:
@@ -77,68 +84,68 @@ Trying to read a message from the server which is larger than `read_buf` (or `re
 
 If you get an `error.ReadBufferIsFull`, you can try to use `client.lastPartialPacket()` which returns a `?PartialPacket`. This is primarily meant to expose the `packet_identifier` of the message which was too large. (Note that, for a Publish message, the packet_identifier comes _after_ the topic, so a very large topic, or a very small `read_buf` will return a `null` value).
 
-## deinit(self: \*Client) void
+## deinit(self: \*Client5) void
 Closes the socket (if it's still open) and releases the `read_buf` and `write_buf` if they are owned by the client.
 
 For a clean shutdown, you might want to call `disconnect` before calling `deinit`.
 
-### lastError(self: \*Client) ?mqttz.ErrorDetail
+### lastError(self: \*Client5) ?mqttz.ErrorDetail
 The library attempts to make errors easy to manage while still providing some detail. The library typically returns a handful of higher-level errors (which makes it easier) while optionally exposing an error payload. The `lastErorr` method returns the error payload. (See the [errors section](#errors).
 
-### lastReadPacket(self: \*Client) []const u8
+### lastReadPacket(self: \*Client5) []const u8
 The last read packet. Only meant to be used for debugging. Only valid until the next call to `readPacket`.
 
-### connect(self: \*Client, rw: ReadWriteOpts, opts: ConnectOpts) !void
+### connect(self: \*Client5, rw: ReadWriteOpts, opts: ConnectOpts) !void
 Sends a connect packet.
 
-### publish(self: \*Client, rw: ReadWriteOpts, opts: PublishOpts) !?u16
+### publish(self: \*Client5, rw: ReadWriteOpts, opts: PublishOpts) !?u16
 Sends a publish packet. If `opts.qos` was either `at_least_once` or `exactly_once`, then the returned value is the packet identifier, else it is null. The packet identifier is used to pair this publish with `puback`, `pubrec`, `pubrel` or `pubcomp` packets received from `readPacket`.
 
 The packet identifier is an incrementing integer. It can also be explicitly set via `opts.packet_identifier`.
 
-### subscribe(self: \*Client, rw: ReadWriteOpts, opts: SubscribeOpts) !u16
+### subscribe(self: \*Client5, rw: ReadWriteOpts, opts: SubscribeOpts) !u16
 Sends a subscribe packet. The return value is a packet identifier used to pair this message with the corresponding suback message read via `readPacket`. 
 
 The packet identifier is an incrementing integer. It can also be explicitly set via `opts.packet_identifier`.
 
-### unsubscribe(self: \*Client, rw: ReadWriteOpts, opts: UnsubscribeOpts) !u16
+### unsubscribe(self: \*Client5, rw: ReadWriteOpts, opts: UnsubscribeOpts) !u16
 Sends a unsubscribe packet. The return value is a packet identifier used to pair this message with the corresponding unsuback message read via `readPacket`. 
 
 The packet identifier is an incrementing integer. It can also be explicitly set via `opts.packet_identifier`.
 
-### puback(self: \*Client, rw: ReadWriteOpts, opts: PubAckOpts) !void
+### puback(self: \*Client5, rw: ReadWriteOpts, opts: PubAckOpts) !void
 Sends a puback packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
 
-### pubrec(self: \*Client, rw: ReadWriteOpts, opts: PubRecOpts) !void
+### pubrec(self: \*Client5, rw: ReadWriteOpts, opts: PubRecOpts) !void
 Sends a pubrec packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
 
-### pubrel(self: \*Client, rw: ReadWriteOpts, opts: PubRelOpts) !void
+### pubrel(self: \*Client5, rw: ReadWriteOpts, opts: PubRelOpts) !void
 Sends a pubrel packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
 
-### pubcomp(self: \*Client, rw: ReadWriteOpts, opts: PubCompOpts) !void
+### pubcomp(self: \*Client5, rw: ReadWriteOpts, opts: PubCompOpts) !void
 Sends a pubcomb packet. `opts.packet_identifier` must be set. `opts.reason_code` defaults to `.success`.
 
-### ping(self: \*Client, rw: ReadWriteOpts) !void
+### ping(self: \*Client5, rw: ReadWriteOpts) !void
 Sends a ping packet.
 
-### disconnect(self: \*Client, rw: ReadWriteOpts, opts: DisconnectOpts) !void
+### disconnect(self: \*Client5, rw: ReadWriteOpts, opts: DisconnectOpts) !void
 Sends a disconnect packet. `opts.reason` must be set. This is a no-op if the socket is known to be disconnected (which isn't always the case).
 
 If `rw.retries` is not set, `0` will be set, overriding the default (why retry to connect just to disconnect?).
 
-### readPacket(self: \*Client, rw: ReadWriteOpts) !?mqttz.Packet
+### readPacket(self: \*Client5, rw: ReadWriteOpts) !?mqttz.Packet
 Reads a packet from the server.
 
-## mqtt.Mqtt(T)
-The approach of `mqtt.Mqtt(T)` is to have T provide the `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions. This decouples the `Mqtt(T)` library from platform details.
+## mqtt.Mqtt5(T)
+The approach of `mqtt.Mqtt5(T)` is to have T provide the `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions. This decouples the `Mqtt5(T)` library from platform details.
 
-Unlike most generic implementations, `Mqtt(T)` never references `T`. It merely calls `T.MqttPlatform.read()`, `T.MqttPlatform.write()` and `T.MqttPlatform.close()` with a per-call specific `anytype`. This provides greater flexibility and facilitates composition.
+Unlike most generic implementations, `Mqtt5(T)` never references `T`. It merely calls `T.MqttPlatform.read()`, `T.MqttPlatform.write()` and `T.MqttPlatform.close()` with a per-call specific `anytype`. This provides greater flexibility and facilitates composition.
 
-Consider this partial example which wraps `Mqtt(T)` using `std`:
+Consider this partial example which wraps `Mqtt5(T)` using `std`:
 
 ```zig
 const Client = struct {
-    mqtt: mqtt.Mqtt(Client),
+    mqtt: mqtt.Mqtt5(Client),
     socket: std.posix.socket_t,
 
     // wrap mqtt.subscribe
@@ -176,46 +183,47 @@ const Client = struct {
 }
 ```
 
-While it's common that the state you pass into the various `Mqtt(T)` methods will be of type `*T`, as we can see from the above, this is not required. 
+While it's common that the state you pass into the various `Mqtt5(T)` methods will be of type `*T`, as we can see from the above, this is not required. 
 
 The `read`, `write` and `close` functions are wrapped in the `MqttPlatform` container structure only to help avoid conflicts with any `read`, `write` and `close` function you might want on your own type.
 
 ## T.MqttPlatform.
 T must expose `MqttPlatform.read`, `MqttPlatform.write` and `MqttPlatform.close` functions.
 
-The first parameter to these functions is the same `anytype` that was passed into the `Mqtt(T)` function that triggered it.
+The first parameter to these functions is the same `anytype` that was passed into the `Mqtt5(T)` function that triggered it.
 
 ### T.MqttPlatform.read(state: anytype, buf: []u8, calls: usize) !?usize
 Reads data into `buf` - presumably from a socket referenced directly or indirectly by `state`. Returns the number of bytes read. If `0` is returned, assumes the connection is closed. 
 
 If `null` is returned, then `null` will be returned from `readPacket`. Returning `null` is how timeouts should be implemented, to indicate that there is currently no more data.
 
-Only `Mqtt(T).readPacket` can currently trigger a call to `read`. For a single call to `Mqtt(T).readPacket`, `read` might be called 0 or more times. It would be called 0 times if a previous call to `readPacket` had caused multiple packets to be read. The `calls` parameter indicates the number of times `read` has been called for a single call to `readPacket` (it can be ignored in most cases).
+Only `Mqtt5(T).readPacket` can currently trigger a call to `read`. For a single call to `Mqtt5(T).readPacket`, `read` might be called 0 or more times. It would be called 0 times if a previous call to `readPacket` had caused multiple packets to be read. The `calls` parameter indicates the number of times `read` has been called for a single call to `readPacket` (it can be ignored in most cases).
 
 ### T.MqttPlatform.write(state: anytype, data: []const u8) !void
 Writes `data` - presumably from a socket referenced directly or indirectly by `state`. `write` must write all of `data`.
 
 ### T.MqttPlatform.close(state: anytype) !void
-Called with `Mqtt(T).disconnect` is called.
+Called with `Mqtt5(T).disconnect` is called.
 
 This can be called internally, via `disconnect`, by the library as required by the specification (e.g. when a `connack` response is received with indicating that a session is present, but `clean_start` was specified).
 
-Since `Mqtt(T)` is relatively stateless, it's possible for `close` to be called when your implementations' socket is already closed.
+Since `Mqtt5(T)` is relatively stateless, it's possible for `close` to be called when your implementations' socket is already closed.
 
 ## Errors
-`Mqtt(T)` methods return errors which are meant to be easy(ish) to manage. The `last_error` field is an optional tagged union that can include additional information. The ideas is to provide a manageable number of error values without sacrificing additional details (which might traditionally be handled by having a much larger error set, which is harder to handle).
+`Mqtt5(T)` methods return errors which are meant to be easy(ish) to manage. The `last_error` field is an optional tagged union that can include additional information. The ideas is to provide a manageable number of error values without sacrificing additional details (which might traditionally be handled by having a much larger error set, which is harder to handle).
 
 For example, the only errors `subscribe` can return are: `error.Usage`, `error.WriteBufferIsFull` or any error your `T.write` method returns. If an error is returned, in most cases the optional `last_error` field will be set. 
 
-# Mqtt(T)
-As a consequence of being a foundation, `Mqtt(T)` has a simple interface.
 
-## init(read_buf: []u8, write_buf: []u8) Mqtt(T)
+# Mqtt5(T)
+As a consequence of being a foundation, `Mqtt5(T)` has a simple interface.
+
+## init(read_buf: []u8, write_buf: []u8) Mqtt5(T)
 Initializes an instance. 
 
-`read_buf` must remain valid for the lifetime of the returned `Mqtt(T)` value. `read_buf` must be big enough to handle any message received by the server. If you're only publishing message, than `read_buf` can be relatively small. If you're receiving message, then you'll have to size `read_buf` accordingly. `error.ReadBufferIsFull` is returned from reading functions (i.e. `readPacket`) if `read_buf` is too small to accommodate the packet.
+`read_buf` must remain valid for the lifetime of the returned `Mqtt5(T)` value. `read_buf` must be big enough to handle any message received by the server. If you're only publishing message, than `read_buf` can be relatively small. If you're receiving message, then you'll have to size `read_buf` accordingly. `error.ReadBufferIsFull` is returned from reading functions (i.e. `readPacket`) if `read_buf` is too small to accommodate the packet.
 
-`write_buf` must remain valid for the lifetime of the returned `Mqtt(T)` value. `write_buf` must be big enough to handle any message sent to the server. If you're only only receiving messages, then `write_buf` can be relatively small. If you're sending message, then you'll have to size `write_buf` accordingly. `error.WriteBufferIsFull` is returned from writing functions (i.e. `connect`, `subscribe`, `publish`, ...) if `write_buf` is too small to accommodate the packet.
+`write_buf` must remain valid for the lifetime of the returned `Mqtt5(T)` value. `write_buf` must be big enough to handle any message sent to the server. If you're only only receiving messages, then `write_buf` can be relatively small. If you're sending message, then you'll have to size `write_buf` accordingly. `error.WriteBufferIsFull` is returned from writing functions (i.e. `connect`, `subscribe`, `publish`, ...) if `write_buf` is too small to accommodate the packet.
 
 MQTT is a compact protocol. To figure out the size you'll need, you can generally add up the length of your longest strings (like the name of the topic + the message) and add a few bytes of overhead.
 

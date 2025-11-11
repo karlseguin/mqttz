@@ -223,7 +223,7 @@ pub fn encodeConnect(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion
         0; // MQTT 3.1.1 has no properties
 
     // Start payload
-    var pos = PROPERTIES_OFFSET + properties_len;
+    var pos: usize = PROPERTIES_OFFSET + properties_len;
     pos += try writeString(buf[pos..], opts.client_id orelse "");
 
     if (opts.will) |will| {
@@ -290,7 +290,7 @@ pub fn encodeSubscribe(buf: []u8, comptime protocol_version: mqttz.ProtocolVersi
     else
         0; // MQTT 3.1.1 has no properties
 
-    var pos = PROPERTIES_OFFSET + properties_len;
+    var pos: usize = PROPERTIES_OFFSET + properties_len;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic.filter);
         if (comptime protocol_version == .mqtt_5_0) {
