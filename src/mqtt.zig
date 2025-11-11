@@ -4,9 +4,34 @@ const PropertyReader = properties.Reader;
 
 pub const posix = @import("posix.zig");
 
-pub const ProtocolVersion = enum(u8) {
-    mqtt_3_1_1 = 4,
-    mqtt_5_0 = 5,
+pub const ProtocolVersion = union(enum) {
+    mqtt_5_0: void,
+    mqtt_3_1_1: bool, // true = strict validation, false = permissive
+
+    pub fn byte(self: ProtocolVersion) u8 {
+        return switch (self) {
+            .mqtt_5_0 => 5,
+            .mqtt_3_1_1 => 4,
+        };
+    }
+
+    pub fn is_5_0(comptime self: ProtocolVersion) bool {
+        return self == .mqtt_5_0;
+    }
+
+    pub fn is_3_1_1(comptime self: ProtocolVersion) bool {
+        return switch (self) {
+            .mqtt_3_1_1 => true,
+            else => false,
+        };
+    }
+
+    pub fn is_strict(comptime self: ProtocolVersion) bool {
+        return switch (self) {
+            .mqtt_3_1_1 => |strict| strict,
+            else => false,
+        };
+    }
 };
 
 pub const QoS = enum(u2) {
@@ -221,8 +246,13 @@ pub const ErrorDetail = union(enum) {
 pub fn Mqtt5(comptime T: type) type {
     return Mqtt(T, .mqtt_5_0);
 }
+
 pub fn Mqtt311(comptime T: type) type {
-    return Mqtt(T, .mqtt_3_1_1);
+    return Mqtt(T, .{ .mqtt_3_1_1 = false });
+}
+
+pub fn Mqtt311Strict(comptime T: type) type {
+    return Mqtt(T, .{ .mqtt_3_1_1 = true });
 }
 pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
     return struct {
