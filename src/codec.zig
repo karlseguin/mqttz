@@ -4,6 +4,11 @@ const properties = @import("properties.zig");
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 
+// Error for using MQTT 5.0 properties with strict MQTT 3.1.1
+pub const Mqtt311Error = error{
+    UnsupportedPropertyForMqtt311,
+};
+
 // I hate varints.
 pub fn writeVarint(buf: []u8, len: usize) usize {
     var i: usize = 0;
@@ -100,7 +105,81 @@ pub fn readString(buf: []const u8) error{InvalidString}!struct { []const u8, usi
     return .{ buf[2..end], end };
 }
 
-pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
+// Validation functions for strict MQTT 3.1.1 mode
+fn validateConnectOptsFor311(opts: mqttz.ConnectOpts) Mqtt311Error!void {
+    if (opts.session_expiry_interval != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.receive_maximum != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.maximum_packet_size != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+
+    if (opts.will) |will| {
+        if (will.delay_interval != null) return error.UnsupportedPropertyForMqtt311;
+        if (will.payload_format != null) return error.UnsupportedPropertyForMqtt311;
+        if (will.message_expiry_interval != null) return error.UnsupportedPropertyForMqtt311;
+        if (will.content_type != null) return error.UnsupportedPropertyForMqtt311;
+        if (will.response_topic != null) return error.UnsupportedPropertyForMqtt311;
+        if (will.correlation_data != null) return error.UnsupportedPropertyForMqtt311;
+    }
+}
+
+fn validateDisconnectOptsFor311(opts: mqttz.DisconnectOpts) Mqtt311Error!void {
+    // In MQTT 3.1.1, DISCONNECT has no variable header, so all fields are 5.0 only
+    // Check if any MQTT 5.0 properties are set
+    if (opts.reason != .normal) return error.UnsupportedPropertyForMqtt311;
+    if (opts.session_expiry_interval != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.reason_string != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+}
+
+fn validateSubscribeOptsFor311(opts: mqttz.SubscribeOpts) Mqtt311Error!void {
+    if (opts.subscription_identifier != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+
+    for (opts.topics) |topic| {
+        // In 3.1.1, these options don't exist (only QoS exists)
+        if (topic.no_local != true) return error.UnsupportedPropertyForMqtt311;
+        if (topic.retain_as_published != false) return error.UnsupportedPropertyForMqtt311;
+        if (topic.retain_handling != .do_not_send_retained) return error.UnsupportedPropertyForMqtt311;
+    }
+}
+
+fn validatePublishOptsFor311(opts: mqttz.PublishOpts) Mqtt311Error!void {
+    if (opts.payload_format != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.message_expiry_interval != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.topic_alias != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.response_topic != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.correlation_data != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.subscription_identifier != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.content_type != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+}
+
+fn validatePubAckOptsFor311(opts: mqttz.PubAckOpts) Mqtt311Error!void {
+    if (opts.reason_string != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+}
+
+fn validatePubRecOptsFor311(opts: mqttz.PubRecOpts) Mqtt311Error!void {
+    if (opts.reason_string != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+}
+
+fn validatePubRelOptsFor311(opts: mqttz.PubRelOpts) Mqtt311Error!void {
+    if (opts.reason_string != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+}
+
+fn validatePubCompOptsFor311(opts: mqttz.PubCompOpts) Mqtt311Error!void {
+    if (opts.reason_string != null) return error.UnsupportedPropertyForMqtt311;
+    if (opts.user_properties != null) return error.UnsupportedPropertyForMqtt311;
+}
+
+pub fn encodeConnect(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.ConnectOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validateConnectOptsFor311(opts);
+    }
+
     var connect_flags = packed struct(u8) {
         _reserved: bool = false,
         clean_start: bool = true,
@@ -129,7 +208,7 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     buf[9] = 'T';
     buf[10] = 'T';
 
-    buf[11] = 5; // protocol
+    buf[11] = protocol_version.byte();
 
     buf[12] = @bitCast(connect_flags);
 
@@ -138,14 +217,22 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     // everything above is safe, since buf is at least MIN_BUF_SIZE.
 
     const PROPERTIES_OFFSET = 15;
-    const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.CONNECT);
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
+        try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.CONNECT)
+    else
+        0; // MQTT 3.1.1 has no properties
 
     // Start payload
-    var pos = PROPERTIES_OFFSET + properties_len;
+    var pos: usize = PROPERTIES_OFFSET + properties_len;
     pos += try writeString(buf[pos..], opts.client_id orelse "");
 
     if (opts.will) |will| {
-        pos += try properties.write(buf[pos..], will, &properties.WILL);
+        pos += if (comptime protocol_version == .mqtt_5_0)
+            try properties.write(buf[pos..], will, &properties.WILL)
+        else
+            0; // MQTT 3.1.1 has no will properties
+        pos += try writeString(buf[pos..], will.topic);
+        pos += try writeString(buf[pos..], will.message);
     }
 
     if (opts.username) |u| {
@@ -158,7 +245,18 @@ pub fn encodeConnect(buf: []u8, opts: mqttz.ConnectOpts) ![]u8 {
     return encodePacketHeader(buf[0..pos], 1, 0);
 }
 
-pub fn encodeDisconnect(buf: []u8, opts: mqttz.DisconnectOpts) ![]u8 {
+pub fn encodeDisconnect(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.DisconnectOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validateDisconnectOptsFor311(opts);
+    }
+
+    // In MQTT 3.1.1, DISCONNECT has no variable header (only fixed header)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        return encodePacketHeader(buf[0..5], 14, 0);
+    }
+
+    // MQTT 5.0: has reason code and properties
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     buf[5] = @intFromEnum(opts.reason);
@@ -168,7 +266,12 @@ pub fn encodeDisconnect(buf: []u8, opts: mqttz.DisconnectOpts) ![]u8 {
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 14, 0);
 }
 
-pub fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.SubscribeOpts) ![]u8 {
+pub fn encodeSubscribe(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, packet_identifier: u16, opts: mqttz.SubscribeOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validateSubscribeOptsFor311(opts);
+    }
+
     const SubscriptionOptions = packed struct(u8) {
         qos: mqttz.QoS,
         no_local: bool,
@@ -182,30 +285,42 @@ pub fn encodeSubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.SubscribeO
 
     writeInt(u16, buf[5..7], packet_identifier);
     const PROPERTIES_OFFSET = 7;
-    const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.SUBSCRIBE);
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
+        try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.SUBSCRIBE)
+    else
+        0; // MQTT 3.1.1 has no properties
 
-    var pos = PROPERTIES_OFFSET + properties_len;
+    var pos: usize = PROPERTIES_OFFSET + properties_len;
     for (opts.topics) |topic| {
         pos += try writeString(buf[pos..], topic.filter);
-        const subscription_options = SubscriptionOptions{
-            .qos = topic.qos,
-            .no_local = topic.no_local,
-            .retain_as_published = topic.retain_as_published,
-            .retain_handling = topic.retain_handling,
-        };
-        buf[pos] = @bitCast(subscription_options);
-        pos += 1;
+        if (comptime protocol_version == .mqtt_5_0) {
+            const subscription_options = SubscriptionOptions{
+                .qos = topic.qos,
+                .no_local = topic.no_local,
+                .retain_as_published = topic.retain_as_published,
+                .retain_handling = topic.retain_handling,
+            };
+            buf[pos] = @bitCast(subscription_options);
+            pos += 1;
+        } else {
+            // MQTT 3.1.1: just QoS byte
+            buf[pos] = @intFromEnum(topic.qos);
+            pos += 1;
+        }
     }
 
     return encodePacketHeader(buf[0..pos], 8, 2);
 }
 
-pub fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.UnsubscribeOpts) ![]u8 {
+pub fn encodeUnsubscribe(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, packet_identifier: u16, opts: mqttz.UnsubscribeOpts) ![]u8 {
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], packet_identifier);
     const PROPERTIES_OFFSET = 7;
-    const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.UNSUBSCRIBE);
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
+        try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.UNSUBSCRIBE)
+    else
+        0; // MQTT 3.1.1 has no properties
 
     var pos = PROPERTIES_OFFSET + properties_len;
     for (opts.topics) |topic| {
@@ -215,7 +330,12 @@ pub fn encodeUnsubscribe(buf: []u8, packet_identifier: u16, opts: mqttz.Unsubscr
     return encodePacketHeader(buf[0..pos], 10, 2);
 }
 
-pub fn encodePublish(buf: []u8, packet_identifier: ?u16, opts: mqttz.PublishOpts) ![]u8 {
+pub fn encodePublish(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, packet_identifier: ?u16, opts: mqttz.PublishOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validatePublishOptsFor311(opts);
+    }
+
     const publish_flags = PublishFlags{
         .dup = opts.dup,
         .qos = opts.qos,
@@ -234,7 +354,10 @@ pub fn encodePublish(buf: []u8, packet_identifier: ?u16, opts: mqttz.PublishOpts
         writeInt(u16, buf[packet_identifier_offset..properties_offset][0..2], pi);
     }
 
-    const properties_len = try properties.write(buf[properties_offset..], opts, &properties.PUBLISH);
+    const properties_len = if (comptime protocol_version == .mqtt_5_0)
+        try properties.write(buf[properties_offset..], opts, &properties.PUBLISH)
+    else
+        0; // MQTT 3.1.1 has no properties
 
     const payload_offset = properties_offset + properties_len;
     const message = opts.message;
@@ -246,10 +369,24 @@ pub fn encodePublish(buf: []u8, packet_identifier: ?u16, opts: mqttz.PublishOpts
     return encodePacketHeader(buf[0..end], 3, @as(u4, @bitCast(publish_flags)));
 }
 
-pub fn encodePubAck(buf: []u8, opts: mqttz.PubAckOpts) ![]u8 {
+pub fn encodePubAck(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubAckOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validatePubAckOptsFor311(opts);
+    }
+
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        buf[3] = 64; // packet type (0100) + flags (0000)
+        buf[4] = 2; // remaining length
+        return buf[3..7];
+    }
+
+    // MQTT 5.0: has reason code and properties
     buf[7] = @intFromEnum(opts.reason_code);
     const PROPERTIES_OFFSET = 8;
     const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBACK);
@@ -266,10 +403,24 @@ pub fn encodePubAck(buf: []u8, opts: mqttz.PubAckOpts) ![]u8 {
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 4, 0);
 }
 
-pub fn encodePubRec(buf: []u8, opts: mqttz.PubRecOpts) ![]u8 {
+pub fn encodePubRec(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubRecOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validatePubRecOptsFor311(opts);
+    }
+
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        buf[3] = 80; // packet type (0101) + flags (0000)
+        buf[4] = 2; // remaining length
+        return buf[3..7];
+    }
+
+    // MQTT 5.0: has reason code and properties
     buf[7] = @intFromEnum(opts.reason_code);
     const PROPERTIES_OFFSET = 8;
     const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREC);
@@ -286,10 +437,24 @@ pub fn encodePubRec(buf: []u8, opts: mqttz.PubRecOpts) ![]u8 {
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 5, 0);
 }
 
-pub fn encodePubRel(buf: []u8, opts: mqttz.PubRelOpts) ![]u8 {
+pub fn encodePubRel(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubRelOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validatePubRelOptsFor311(opts);
+    }
+
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        buf[3] = 98; // packet type (0110) + flags (0010)
+        buf[4] = 2; // remaining length
+        return buf[3..7];
+    }
+
+    // MQTT 5.0: has reason code and properties
     buf[7] = @intFromEnum(opts.reason_code);
     const PROPERTIES_OFFSET = 8;
     const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBREL);
@@ -298,7 +463,7 @@ pub fn encodePubRel(buf: []u8, opts: mqttz.PubRelOpts) ![]u8 {
         // special case, if the reason code is 0 and ther are no properties
         // we can ommit both, and thus we only have a packet with
         // type+flag, length (of 2), 2 byte packet_identifier
-        buf[3] = 98; // packet type (0101) + flags (0010)
+        buf[3] = 98; // packet type (0110) + flags (0010)
         buf[4] = 2; // remaining length
         return buf[3..7];
     }
@@ -306,10 +471,24 @@ pub fn encodePubRel(buf: []u8, opts: mqttz.PubRelOpts) ![]u8 {
     return encodePacketHeader(buf[0 .. PROPERTIES_OFFSET + properties_len], 6, 2);
 }
 
-pub fn encodePubComp(buf: []u8, opts: mqttz.PubCompOpts) ![]u8 {
+pub fn encodePubComp(buf: []u8, comptime protocol_version: mqttz.ProtocolVersion, opts: mqttz.PubCompOpts) ![]u8 {
+    // Validate that no MQTT 5.0 properties are used in strict 3.1.1 mode
+    if (comptime protocol_version.is_strict()) {
+        try validatePubCompOptsFor311(opts);
+    }
+
     // reserve 1 byte for the packet type
     // reserve 4 bytes for the packet length (which might be less than 4 bytes)
     writeInt(u16, buf[5..7], opts.packet_identifier);
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        buf[3] = 112; // packet type (0111) + flags (0000)
+        buf[4] = 2; // remaining length
+        return buf[3..7];
+    }
+
+    // MQTT 5.0: has reason code and properties
     buf[7] = @intFromEnum(opts.reason_code);
     const PROPERTIES_OFFSET = 8;
     const properties_len = try properties.write(buf[PROPERTIES_OFFSET..], opts, &properties.PUBCOMP);

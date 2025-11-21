@@ -4,6 +4,36 @@ const PropertyReader = properties.Reader;
 
 pub const posix = @import("posix.zig");
 
+pub const ProtocolVersion = union(enum) {
+    mqtt_5_0: void,
+    mqtt_3_1_1: bool, // true = strict validation, false = permissive
+
+    pub fn byte(self: ProtocolVersion) u8 {
+        return switch (self) {
+            .mqtt_5_0 => 5,
+            .mqtt_3_1_1 => 4,
+        };
+    }
+
+    pub fn is_5_0(comptime self: ProtocolVersion) bool {
+        return self == .mqtt_5_0;
+    }
+
+    pub fn is_3_1_1(comptime self: ProtocolVersion) bool {
+        return switch (self) {
+            .mqtt_3_1_1 => true,
+            else => false,
+        };
+    }
+
+    pub fn is_strict(comptime self: ProtocolVersion) bool {
+        return switch (self) {
+            .mqtt_3_1_1 => |strict| strict,
+            else => false,
+        };
+    }
+};
+
 pub const QoS = enum(u2) {
     at_most_once = 0,
     at_least_once = 1,
@@ -213,7 +243,18 @@ pub const ErrorDetail = union(enum) {
     reason: ErrorReasonCode,
 };
 
-pub fn Mqtt(comptime T: type) type {
+pub fn Mqtt5(comptime T: type) type {
+    return Mqtt(T, .mqtt_5_0);
+}
+pub fn Mqtt311(comptime T: type) type {
+    return Mqtt(T, .{ .mqtt_3_1_1 = true });
+}
+pub fn Mqtt311NoCheck(comptime T: type) type {
+    return Mqtt(T, .{ .mqtt_3_1_1 = false });
+}
+
+
+pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
     return struct {
         // buffer used for reading messages from the server. If a single message
         // is larger than this, methods will return a error.ReadBufferIsFull
@@ -283,10 +324,10 @@ pub fn Mqtt(comptime T: type) type {
             return PartialPacket.decode(buf[0], buf[fixed_header_len..@min(total_len, buf.len)]);
         }
 
-        const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).@"fn".return_type.?).error_union.error_set;
+        const WriteError = @typeInfo(@typeInfo(@TypeOf(T.MqttPlatform.write)).@"fn".return_type.?).error_union.error_set || error{UnsupportedPropertyForMqtt311};
 
         pub fn connect(self: *Self, state: anytype, opts: ConnectOpts) (WriteError || error{WriteBufferIsFull})!void {
-            const connect_packet = try codec.encodeConnect(self.write_buf, opts);
+            const connect_packet = try codec.encodeConnect(self.write_buf, protocol_version, opts);
             try self.writePacket(state, connect_packet);
         }
 
@@ -297,7 +338,7 @@ pub fn Mqtt(comptime T: type) type {
             }
 
             const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-            const subscribe_packet = try codec.encodeSubscribe(self.write_buf, packet_identifier, opts);
+            const subscribe_packet = try codec.encodeSubscribe(self.write_buf, protocol_version, packet_identifier, opts);
             try self.writePacket(state, subscribe_packet);
             return packet_identifier;
         }
@@ -309,7 +350,7 @@ pub fn Mqtt(comptime T: type) type {
             }
 
             const packet_identifier = self.packetIdentifier(opts.packet_identifier);
-            const unsubscribe_packet = try codec.encodeUnsubscribe(self.write_buf, packet_identifier, opts);
+            const unsubscribe_packet = try codec.encodeUnsubscribe(self.write_buf, protocol_version, packet_identifier, opts);
             try self.writePacket(state, unsubscribe_packet);
             return packet_identifier;
         }
@@ -330,28 +371,28 @@ pub fn Mqtt(comptime T: type) type {
                 packet_identifier = self.packetIdentifier(opts.packet_identifier);
             }
 
-            const publish_packet = try codec.encodePublish(self.write_buf, packet_identifier, opts);
+            const publish_packet = try codec.encodePublish(self.write_buf, protocol_version, packet_identifier, opts);
             try self.writePacket(state, publish_packet);
             return packet_identifier;
         }
 
         pub fn puback(self: *Self, state: anytype, opts: PubAckOpts) (WriteError || error{WriteBufferIsFull})!void {
-            const puback_packet = try codec.encodePubAck(self.write_buf, opts);
+            const puback_packet = try codec.encodePubAck(self.write_buf, protocol_version, opts);
             try self.writePacket(state, puback_packet);
         }
 
         pub fn pubrec(self: *Self, state: anytype, opts: PubRecOpts) (WriteError || error{WriteBufferIsFull})!void {
-            const pubrec_packet = try codec.encodePubRec(self.write_buf, opts);
+            const pubrec_packet = try codec.encodePubRec(self.write_buf, protocol_version, opts);
             try self.writePacket(state, pubrec_packet);
         }
 
         pub fn pubrel(self: *Self, state: anytype, opts: PubRelOpts) (WriteError || error{WriteBufferIsFull})!void {
-            const pubrel_packet = try codec.encodePubRel(self.write_buf, opts);
+            const pubrel_packet = try codec.encodePubRel(self.write_buf, protocol_version, opts);
             try self.writePacket(state, pubrel_packet);
         }
 
         pub fn pubcomp(self: *Self, state: anytype, opts: PubCompOpts) (WriteError || error{WriteBufferIsFull})!void {
-            const pubcomp_packet = try codec.encodePubComp(self.write_buf, opts);
+            const pubcomp_packet = try codec.encodePubComp(self.write_buf, protocol_version, opts);
             try self.writePacket(state, pubcomp_packet);
         }
 
@@ -361,9 +402,9 @@ pub fn Mqtt(comptime T: type) type {
             try self.writePacket(state, &.{ 192, 0 });
         }
 
-        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull})!void {
+        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull,})!void {
             defer T.MqttPlatform.close(state);
-            const disconnect_packet = try codec.encodeDisconnect(self.write_buf, opts);
+            const disconnect_packet = try codec.encodeDisconnect(self.write_buf, protocol_version, opts);
             return self.writePacket(state, disconnect_packet);
         }
 
@@ -480,7 +521,7 @@ pub fn Mqtt(comptime T: type) type {
             }
 
             self.read_pos += total_len;
-            return Packet.decode(buf[0], buf[fixed_header_len..total_len]) catch |err| {
+            return Packet.decode(buf[0], buf[fixed_header_len..total_len], protocol_version) catch |err| {
                 self.last_error = .{ .inner = err };
                 switch (err) {
                     error.UnknownPacketType => return error.Protocol,
@@ -773,21 +814,21 @@ pub const Packet = union(enum) {
         };
     };
 
-    pub fn decode(b1: u8, data: []u8) !Packet {
+    pub fn decode(b1: u8, data: []u8, comptime protocol_version: ProtocolVersion) !Packet {
         // data.len has to be > 0
         // TODO: how to assert without std?
         const flags: u4 = @intCast(b1 & 15);
         switch (b1 >> 4) {
-            2 => return .{ .connack = try decodeConnAck(data, flags) },
-            3 => return .{ .publish = try decodePublish(data, flags) },
-            4 => return .{ .puback = try decodePubAck(data, flags) },
-            5 => return .{ .pubrec = try decodePubRec(data, flags) },
-            6 => return .{ .pubrel = try decodePubRel(data, flags) },
-            7 => return .{ .pubcomp = try decodePubComp(data, flags) },
-            9 => return .{ .suback = try decodeSubAck(data, flags) },
-            11 => return .{ .unsuback = try decodeUnsubAck(data, flags) },
+            2 => return .{ .connack = try decodeConnAck(data, flags, protocol_version) },
+            3 => return .{ .publish = try decodePublish(data, flags, protocol_version) },
+            4 => return .{ .puback = try decodePubAck(data, flags, protocol_version) },
+            5 => return .{ .pubrec = try decodePubRec(data, flags, protocol_version) },
+            6 => return .{ .pubrel = try decodePubRel(data, flags, protocol_version) },
+            7 => return .{ .pubcomp = try decodePubComp(data, flags, protocol_version) },
+            9 => return .{ .suback = try decodeSubAck(data, flags, protocol_version) },
+            11 => return .{ .unsuback = try decodeUnsubAck(data, flags, protocol_version) },
             13 => return if (flags == 0) .{ .pong = {} } else error.InvalidFlags,
-            14 => return .{ .disconnect = try decodeDisconnect(data, flags) },
+            14 => return .{ .disconnect = try decodeDisconnect(data, flags, protocol_version) },
             else => return error.UnknownPacketType, // TODO
         }
     }
@@ -866,14 +907,15 @@ pub const PartialPacket = union(enum) {
     }
 };
 
-fn decodeConnAck(data: []u8, flags: u4) !Packet.ConnAck {
+fn decodeConnAck(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.ConnAck {
     if (flags != 0) {
         return error.InvalidFlags;
     }
 
-    if (data.len < 3) {
-        // must have at least 3 bytes
-        // (ConnAct flag, Reason Code, Property Length)
+    const min_len: usize = if (comptime protocol_version == .mqtt_3_1_1) 2 else 3;
+    if (data.len < min_len) {
+        // MQTT 3.1.1: must have at least 2 bytes (ConnAck flag, Return Code)
+        // MQTT 5.0: must have at least 3 bytes (ConnAck flag, Reason Code, Property Length)
         return error.IncompletePacket;
     }
 
@@ -914,47 +956,49 @@ fn decodeConnAck(data: []u8, flags: u4) !Packet.ConnAck {
         .reason_code = reason_code,
     };
 
-    var props = try PropertyReader.init(data[2..]);
-    while (try props.next()) |prop| {
-        switch (prop) {
-            .session_expiry_interval => |v| connack.session_expiry_interval = v,
-            .receive_maximum => |v| connack.receive_maximum = v,
-            .maximum_qos => |v| connack.maximum_qos = v,
-            .retain_available => |v| connack.retain_available = v,
-            .maximum_packet_size => |v| connack.maximum_packet_size = v,
-            .assigned_client_identifier => |v| connack.assigned_client_identifier = v,
-            .topic_alias_maximum => |v| connack.topic_alias_maximum = v,
-            .reason_string => |v| connack.reason_string = v,
-            .wildcard_subscription_available => |v| connack.wildcard_subscription_available = v,
-            .subscription_identifier_available => |v| connack.subscription_identifier_available = v,
-            .shared_subscription_available => |v| connack.shared_subscription_available = v,
-            .server_keepalive => |v| connack.server_keepalive = v,
-            .response_information => |v| connack.response_information = v,
-            .server_reference => |v| connack.server_reference = v,
-            .authentication_method => |v| connack.authentication_method = v,
-            .authentication_data => |v| connack.authentication_data = v,
-            .user_properties => |v| {
-                if (connack._user_properties == null) {
-                    connack._user_properties = v;
-                }
-            },
-            else => return error.InvalidProperty,
+    // MQTT 5.0: read properties
+    if (comptime protocol_version == .mqtt_5_0) {
+        var props = try PropertyReader.init(data[2..]);
+        while (try props.next()) |prop| {
+            switch (prop) {
+                .session_expiry_interval => |v| connack.session_expiry_interval = v,
+                .receive_maximum => |v| connack.receive_maximum = v,
+                .maximum_qos => |v| connack.maximum_qos = v,
+                .retain_available => |v| connack.retain_available = v,
+                .maximum_packet_size => |v| connack.maximum_packet_size = v,
+                .assigned_client_identifier => |v| connack.assigned_client_identifier = v,
+                .topic_alias_maximum => |v| connack.topic_alias_maximum = v,
+                .reason_string => |v| connack.reason_string = v,
+                .wildcard_subscription_available => |v| connack.wildcard_subscription_available = v,
+                .subscription_identifier_available => |v| connack.subscription_identifier_available = v,
+                .shared_subscription_available => |v| connack.shared_subscription_available = v,
+                .server_keepalive => |v| connack.server_keepalive = v,
+                .response_information => |v| connack.response_information = v,
+                .server_reference => |v| connack.server_reference = v,
+                .authentication_method => |v| connack.authentication_method = v,
+                .authentication_data => |v| connack.authentication_data = v,
+                .user_properties => |v| {
+                    if (connack._user_properties == null) {
+                        connack._user_properties = v;
+                    }
+                },
+                else => return error.InvalidProperty,
+            }
         }
     }
 
     return connack;
 }
 
-fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
+fn decodeSubAck(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.SubAck {
     if (flags != 0) {
         return error.InvalidFlags;
     }
 
-    if (data.len < 4) {
-        // must have at least 4 bytes
-        // 2 for the packet identifier
-        // at least 1 for a 0-length property list
-        // at least 1 for 1 reason code in the body
+    const min_len: usize = if (comptime protocol_version == .mqtt_3_1_1) 3 else 4;
+    if (data.len < min_len) {
+        // MQTT 3.1.1: 2 for packet identifier, at least 1 for QoS byte
+        // MQTT 5.0: 2 for packet identifier, at least 1 for property list, at least 1 for reason code
         return error.IncompletePacket;
     }
 
@@ -963,24 +1007,30 @@ fn decodeSubAck(data: []u8, flags: u4) !Packet.SubAck {
         .results = undefined,
     };
 
-    var props = try PropertyReader.init(data[2..]);
-    while (try props.next()) |prop| {
-        switch (prop) {
-            .reason_string => |v| suback.reason_string = v,
-            .user_properties => |v| {
-                if (suback._user_properties == null) {
-                    suback._user_properties = v;
-                }
-            },
-            else => return error.InvalidProperty,
+    var payload_offset: usize = 2;
+
+    // MQTT 5.0: read properties
+    if (comptime protocol_version == .mqtt_5_0) {
+        var props = try PropertyReader.init(data[2..]);
+        while (try props.next()) |prop| {
+            switch (prop) {
+                .reason_string => |v| suback.reason_string = v,
+                .user_properties => |v| {
+                    if (suback._user_properties == null) {
+                        suback._user_properties = v;
+                    }
+                },
+                else => return error.InvalidProperty,
+            }
         }
+        payload_offset = 2 + props.len;
     }
 
     // the rest of the packet is the payload, and the payload is 1 or more
     // 1 byte reason codes. 1 reason code per subscribed topic (in the same order)
     // So if you subscribed to 2 topics and want to know the result of the 2nd one
     // you would check suback.results[1], or better for an enum value: suback.result(1).
-    suback.results = data[2 + props.len ..];
+    suback.results = data[payload_offset..];
     return suback;
 }
 fn decodePartialSubAck(data: []const u8, flags: u4) ?PartialPacket.SubAck {
@@ -998,16 +1048,15 @@ fn decodePartialSubAck(data: []const u8, flags: u4) ?PartialPacket.SubAck {
     return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
-fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
+fn decodeUnsubAck(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.UnsubAck {
     if (flags != 0) {
         return error.InvalidFlags;
     }
 
-    if (data.len < 4) {
-        // must have at least 4 bytes
-        // 2 for the packet identifier
-        // at least 1 for a 0-length property list
-        // at least 1 for 1 reason code in the body
+    const min_len: usize = if (comptime protocol_version == .mqtt_3_1_1) 2 else 4;
+    if (data.len < min_len) {
+        // MQTT 3.1.1: just 2 bytes for packet identifier (no payload)
+        // MQTT 5.0: 2 for packet identifier, at least 1 for property list, at least 1 for reason code
         return error.IncompletePacket;
     }
 
@@ -1016,24 +1065,28 @@ fn decodeUnsubAck(data: []u8, flags: u4) !Packet.UnsubAck {
         .results = undefined,
     };
 
-    var props = try PropertyReader.init(data[2..]);
-    while (try props.next()) |prop| {
-        switch (prop) {
-            .reason_string => |v| unsuback.reason_string = v,
-            .user_properties => |v| {
-                if (unsuback._user_properties == null) {
-                    unsuback._user_properties = v;
-                }
-            },
-            else => return error.InvalidProperty,
+    var payload_offset: usize = 2;
+
+    // MQTT 5.0: read properties
+    if (comptime protocol_version == .mqtt_5_0) {
+        var props = try PropertyReader.init(data[2..]);
+        while (try props.next()) |prop| {
+            switch (prop) {
+                .reason_string => |v| unsuback.reason_string = v,
+                .user_properties => |v| {
+                    if (unsuback._user_properties == null) {
+                        unsuback._user_properties = v;
+                    }
+                },
+                else => return error.InvalidProperty,
+            }
         }
+        payload_offset = 2 + props.len;
     }
 
-    // the rest of the packet is the payload, and the payload is 1 or more
-    // 1 byte reason codes. 1 reason code per unsubscribed topic (in the same order)
-    // So if you unsubscribed to 2 topics and want to know the result of the 2nd one
-    // you would check unsuback.results[1], or better for an enum value: unsuback.result(1).
-    unsuback.results = data[2 + props.len ..];
+    // MQTT 5.0: the rest of the packet is the payload with reason codes
+    // MQTT 3.1.1: no payload (empty results)
+    unsuback.results = data[payload_offset..];
     return unsuback;
 }
 fn decodePartialUnsubAck(data: []const u8, flags: u4) ?PartialPacket.UnsubAck {
@@ -1051,17 +1104,17 @@ fn decodePartialUnsubAck(data: []const u8, flags: u4) ?PartialPacket.UnsubAck {
     return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
-fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
-    if (data.len < 5) {
-        // 2 for the packet identifier
-        // 1 for an empty property list
-        // 2 for an empty message
+fn decodePublish(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.Publish {
+    const min_len: usize = if (comptime protocol_version == .mqtt_3_1_1) 2 else 5;
+    if (data.len < min_len) {
+        // MQTT 3.1.1: 2 for topic length (empty topic + empty message)
+        // MQTT 5.0: 2 for topic, 1 for property list, 2 for message
         return error.IncompletePacket;
     }
 
-    const publish_flags: *codec.PublishFlags = @constCast(@ptrCast(&flags));
+    const publish_flags: *codec.PublishFlags = @ptrCast(@constCast(&flags));
 
-    const topic, var properties_offset = try codec.readString(data);
+    const topic, var message_offset = try codec.readString(data);
     var publish = Packet.Publish{
         .dup = publish_flags.dup,
         .qos = publish_flags.qos,
@@ -1072,31 +1125,35 @@ fn decodePublish(data: []u8, flags: u4) !Packet.Publish {
     };
 
     if (publish.qos != .at_most_once) {
-        const packet_identifier_offset = properties_offset;
-        properties_offset += 2;
-        publish.packet_identifier = codec.readInt(u16, data[packet_identifier_offset..properties_offset][0..2]);
+        const packet_identifier_offset = message_offset;
+        message_offset += 2;
+        publish.packet_identifier = codec.readInt(u16, data[packet_identifier_offset..message_offset][0..2]);
     }
 
-    var props = try PropertyReader.init(data[properties_offset..]);
-    while (try props.next()) |prop| {
-        switch (prop) {
-            .payload_format => |v| publish.payload_format = v,
-            .message_expiry_interval => |v| publish.message_expiry_interval = v,
-            .topic_alias => |v| publish.topic_alias = v,
-            .response_topic => |v| publish.response_topic = v,
-            .correlation_data => |v| publish.correlation_data = v,
-            .subscription_identifier => |v| publish.subscription_identifier = v,
-            .content_type => |v| publish.content_type = v,
-            .user_properties => |v| {
-                if (publish._user_properties == null) {
-                    publish._user_properties = v;
-                }
-            },
-            else => return error.InvalidProperty,
+    // MQTT 5.0: read properties
+    if (comptime protocol_version == .mqtt_5_0) {
+        var props = try PropertyReader.init(data[message_offset..]);
+        while (try props.next()) |prop| {
+            switch (prop) {
+                .payload_format => |v| publish.payload_format = v,
+                .message_expiry_interval => |v| publish.message_expiry_interval = v,
+                .topic_alias => |v| publish.topic_alias = v,
+                .response_topic => |v| publish.response_topic = v,
+                .correlation_data => |v| publish.correlation_data = v,
+                .subscription_identifier => |v| publish.subscription_identifier = v,
+                .content_type => |v| publish.content_type = v,
+                .user_properties => |v| {
+                    if (publish._user_properties == null) {
+                        publish._user_properties = v;
+                    }
+                },
+                else => return error.InvalidProperty,
+            }
         }
+        message_offset += props.len;
     }
 
-    publish.message = data[properties_offset + props.len ..];
+    publish.message = data[message_offset..];
     return publish;
 }
 fn decodePartialPublish(data: []const u8, flags: u4) ?PartialPacket.Publish {
@@ -1107,7 +1164,7 @@ fn decodePartialPublish(data: []const u8, flags: u4) ?PartialPacket.Publish {
         // at least 1 for 1 reason code in the body
         return null;
     }
-    const publish_flags: *codec.PublishFlags = @constCast(@ptrCast(&flags));
+    const publish_flags: *codec.PublishFlags = @ptrCast(@constCast(&flags));
 
     const topic, var properties_offset = codec.readString(data) catch {
         return null;
@@ -1129,7 +1186,7 @@ fn decodePartialPublish(data: []const u8, flags: u4) ?PartialPacket.Publish {
     return publish;
 }
 
-fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
+fn decodePubAck(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.PubAck {
     if (flags != 0) {
         return error.InvalidFlags;
     }
@@ -1139,16 +1196,17 @@ fn decodePubAck(data: []u8, flags: u4) !Packet.PubAck {
     }
 
     const packet_identifier = codec.readInt(u16, data[0..2]);
-    if (data.len == 2) {
-        // special puback with just a packet_identifier
-        // reason_code is implicitly success
-        // no properties
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    // MQTT 5.0: can be just packet identifier if reason code is success and no properties
+    if (data.len == 2 or protocol_version == .mqtt_3_1_1) {
         return .{
             .reason_code = .success,
             .packet_identifier = packet_identifier,
         };
     }
 
+    // MQTT 5.0: has reason code and properties
     const reason_code: PubAckReason = switch (data[2]) {
         0 => .success,
         16 => .no_matching_subscribers,
@@ -1195,7 +1253,7 @@ fn decodePartialPubAck(data: []const u8, flags: u4) ?PartialPacket.PubAck {
     return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
-fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
+fn decodePubRec(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.PubRec {
     if (flags != 0) {
         return error.InvalidFlags;
     }
@@ -1205,16 +1263,17 @@ fn decodePubRec(data: []u8, flags: u4) !Packet.PubRec {
     }
 
     const packet_identifier = codec.readInt(u16, data[0..2]);
-    if (data.len == 2) {
-        // special pubrec with just a packet_identifier
-        // reason_code is implicitly success
-        // no properties
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    // MQTT 5.0: can be just packet identifier if reason code is success and no properties
+    if (data.len == 2 or protocol_version == .mqtt_3_1_1) {
         return .{
             .reason_code = .success,
             .packet_identifier = packet_identifier,
         };
     }
 
+    // MQTT 5.0: has reason code and properties
     const reason_code: PubRecReason = switch (data[2]) {
         0 => .success,
         16 => .no_matching_subscribers,
@@ -1261,7 +1320,7 @@ fn decodePartialPubRec(data: []const u8, flags: u4) ?PartialPacket.PubRec {
     return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
-fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
+fn decodePubRel(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.PubRel {
     if (flags != 2) {
         // what's up with this? Why does this flag have to be 2??
         return error.InvalidFlags;
@@ -1272,16 +1331,17 @@ fn decodePubRel(data: []u8, flags: u4) !Packet.PubRel {
     }
 
     const packet_identifier = codec.readInt(u16, data[0..2]);
-    if (data.len == 2) {
-        // special pubrel with just a packet_identifier
-        // reason_code is implicitly success
-        // no properties
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    // MQTT 5.0: can be just packet identifier if reason code is success and no properties
+    if (data.len == 2 or protocol_version == .mqtt_3_1_1) {
         return .{
             .reason_code = .success,
             .packet_identifier = packet_identifier,
         };
     }
 
+    // MQTT 5.0: has reason code and properties
     const reason_code: PubRelReason = switch (data[2]) {
         0 => .success,
         146 => .packet_identifier_not_found,
@@ -1324,7 +1384,7 @@ fn decodePartialPubRel(data: []const u8, flags: u4) ?PartialPacket.PubRel {
 
 // If you've gotten this far and are thinking: does he plan on DRYing this stuff?
 // The answer is [obviously]..apparently not.
-fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
+fn decodePubComp(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.PubComp {
     if (flags != 0) {
         return error.InvalidFlags;
     }
@@ -1334,16 +1394,17 @@ fn decodePubComp(data: []u8, flags: u4) !Packet.PubComp {
     }
 
     const packet_identifier = codec.readInt(u16, data[0..2]);
-    if (data.len == 2) {
-        // special pubrel with just a packet_identifier
-        // reason_code is implicitly success
-        // no properties
+
+    // MQTT 3.1.1: only packet identifier (2 bytes)
+    // MQTT 5.0: can be just packet identifier if reason code is success and no properties
+    if (data.len == 2 or protocol_version == .mqtt_3_1_1) {
         return .{
             .reason_code = .success,
             .packet_identifier = packet_identifier,
         };
     }
 
+    // MQTT 5.0: has reason code and properties
     const reason_code: PubCompReason = switch (data[2]) {
         0 => .success,
         146 => .packet_identifier_not_found,
@@ -1384,11 +1445,17 @@ fn decodePartialPubComp(data: []const u8, flags: u4) ?PartialPacket.PubComp {
     return .{ .packet_identifier = codec.readInt(u16, data[0..2]) };
 }
 
-fn decodeDisconnect(data: []u8, flags: u4) !Packet.Disconnect {
+fn decodeDisconnect(data: []u8, flags: u4, comptime protocol_version: ProtocolVersion) !Packet.Disconnect {
     if (flags != 0) {
         return error.InvalidFlags;
     }
 
+    // MQTT 3.1.1: DISCONNECT has no variable header (data.len == 0)
+    if (comptime protocol_version == .mqtt_3_1_1) {
+        return .{ .reason_code = .normal };
+    }
+
+    // MQTT 5.0: has reason code and properties
     if (data.len < 2) {
         // 1 for reason code
         // 1 for 0 length properties
@@ -1491,7 +1558,7 @@ test "Client: connect" {
         } });
         try ctx.expectWritten(1, &.{
             16, // packet type
-            142, 1, // payload length
+            166, 1, // payload length
             0, 4, 'M', 'Q', 'T', 'T', // protocol name
             5, // protocol version
             246, // connect flags (1, 1, 1, 1, 0, 1, 1, 0)
@@ -1532,6 +1599,19 @@ test "Client: connect" {
             0x09, 0x00, 0x0B, 'o',  'v',
             'e',  'r',  ' ',  '9',  '0',
             '0',  '0',  '!',  '!',
+            0,   9, // topic length,
+            't', 'h',
+            'e', ' ',
+            't', 'o',
+            'p', 'i',
+            'c',
+            0,   11, // message length,
+            't', 'h',
+            'e', ' ',
+            'm', 'e',
+            's', 's',
+            'a', 'g',
+            'e',
             0,   12, // username length
             't', 'h',
             'e', '-',
@@ -2361,7 +2441,7 @@ test "Client: readPacket publish" {
     {
         // too long
         var buf: [512]u8 = undefined;
-        const msg = try codec.encodePublish(&buf, 9001, .{
+        const msg = try codec.encodePublish(&buf, .mqtt_5_0, 9001, .{
             .topic = "hi",
             .qos = .at_least_once,
             .message = "a" ** 300,
@@ -2666,7 +2746,7 @@ const TestContext = struct {
     write_count: usize,
     close_count: usize,
     _random: ?std.Random.DefaultPrng = null,
-    client: Mqtt(TestContext),
+    client: Mqtt5(TestContext),
 
     const std = @import("std");
 
@@ -2686,7 +2766,7 @@ const TestContext = struct {
             .written = .empty,
             .write_count = 0,
             .close_count = 0,
-            .client = Mqtt(TestContext).init(read_buf, write_buf),
+            .client = Mqtt5(TestContext).init(read_buf, write_buf),
         };
     }
 

@@ -32,7 +32,7 @@ pub fn main() !void {
 
 	var client = Client{
 		.socket = stream.handle,
-		.mqtt = mqttz.Mqtt(Client).init(&read_buf, &write_buf),
+		.mqtt = mqttz.Mqtt5(Client).init(&read_buf, &write_buf),
 	};
 	defer client.disconnect(.normal);
 
@@ -55,7 +55,7 @@ pub fn main() !void {
 // In this example, we use composition. The Client wraps the `Mqtt(T)`.
 const Client = struct {
 	socket: std.posix.socket_t,
-	mqtt: mqttz.Mqtt(Client),
+	mqtt: mqttz.Mqtt5(Client),
 
 	// wrap mqtt methods, largely so we can inject the state
 	// which, in this case (and in most) is going to be the Client itself.
