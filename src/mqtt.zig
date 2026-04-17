@@ -253,7 +253,6 @@ pub fn Mqtt311NoCheck(comptime T: type) type {
     return Mqtt(T, .{ .mqtt_3_1_1 = false });
 }
 
-
 pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
     return struct {
         // buffer used for reading messages from the server. If a single message
@@ -402,7 +401,9 @@ pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
             try self.writePacket(state, &.{ 192, 0 });
         }
 
-        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull,})!void {
+        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{
+            WriteBufferIsFull,
+        })!void {
             defer T.MqttPlatform.close(state);
             const disconnect_packet = try codec.encodeDisconnect(self.write_buf, protocol_version, opts);
             return self.writePacket(state, disconnect_packet);
@@ -1581,8 +1582,7 @@ test "Client: connect" {
             'e', '-',
             'c', 'l',
             'i', 'e',
-            'n',
-            't',
+            'n', 't',
 
             // WILL properties
             51, // will length
