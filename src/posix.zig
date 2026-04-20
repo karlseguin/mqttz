@@ -229,12 +229,11 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 // If retries > 0 and we detect a disconnect, we'll attempt to reload the
                 // socket (hence socket is var, not const).
                 var socket = try client.getOrConnectSocket();
+                var reader_buf: [4096]u8 = undefined;
+                var socket_reader = socket.reader(client.io, &reader_buf);
+                var buf_writer = std.Io.Writer.fixed(buf);
                 loop: while (true) {
-                    const res = socket.socket.receiveTimeout(
-                        client.io,
-                        buf,
-                        .{ .duration = .{ .raw = .fromMilliseconds(absolute_timeout), .clock = .awake } },
-                    ) catch |err| switch (err) {
+                    const res = socket_reader.interface.stream(&buf_writer, .unlimited) catch |err| switch (socket_reader.err.?) {
                         error.ConnectionResetByPeer => {
                             socket = try handleError(client, &retries);
                             continue :loop;
@@ -252,8 +251,10 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                             return err;
                         },
                     };
+                    try buf_writer.flush();
 
-                    if (res.data.len != 0) return res.data.len;
+                    if (res != 0) return res;
+                    continue :loop;
                 }
             }
 
@@ -278,7 +279,6 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                             continue :loop;
                         },
                         else => {
-                            std.debug.print("{any}\n", .{err});
                             client.close();
                             return err;
                         },
@@ -289,7 +289,6 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                             continue :loop;
                         },
                         else => {
-                            std.debug.print("{any}\n", .{err});
                             client.close();
                             return err;
                         },
