@@ -220,7 +220,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
             pub fn read(ctx: *const Context, buf: []u8, _: usize) !?usize {
                 var client = ctx.client;
 
-                const absolute_timeout = std.Io.Clock.now(.awake, client.io).toMilliseconds() + ctx.timeout;
+                // const absolute_timeout = std.Io.Clock.now(.awake, client.io).toMilliseconds() + ctx.timeout;
 
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
@@ -238,13 +238,13 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                             socket = try handleError(client, &retries);
                             continue :loop;
                         },
-                        error.Timeout => {
-                            const timeout: i32 = @intCast(absolute_timeout - std.Io.Clock.now(.awake, client.io).toMilliseconds());
-                            if (timeout < 0) {
-                                return null;
-                            }
-                            continue :loop;
-                        },
+                        // error.Timeout => {
+                        //     const timeout: i32 = @intCast(absolute_timeout - std.Io.Clock.now(.awake, client.io).toMilliseconds());
+                        //     if (timeout < 0) {
+                        //         return null;
+                        //     }
+                        //     continue :loop;
+                        // },
                         else => {
                             std.debug.print("{any}\n", .{err});
                             client.close();
