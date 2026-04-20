@@ -220,40 +220,50 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
             pub fn read(ctx: *const Context, buf: []u8, _: usize) !?usize {
                 var client = ctx.client;
 
-                // const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
+                const absolute_timeout = std.Io.Clock.now(.awake, client.io).toMilliseconds() + ctx.timeout;
 
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
-                const retries = ctx.retries;
-
-                // _ = absolute_timeout;
-                _ = retries;
-
-                // TODO: understand how to integrate timeout and retries.
+                var retries = ctx.retries;
 
                 // If retries > 0 and we detect a disconnect, we'll attempt to reload the
                 // socket (hence socket is var, not const).
                 var socket = try client.getOrConnectSocket();
+                loop: while (true) {
+                    const res = socket.socket.receiveTimeout(
+                        client.io,
+                        buf,
+                        .{ .duration = .{ .raw = .fromMilliseconds(absolute_timeout), .clock = .awake } },
+                    ) catch |err| switch (err) {
+                        error.ConnectionResetByPeer => {
+                            socket = try handleError(client, &retries);
+                            continue :loop;
+                        },
+                        error.Timeout => {
+                            const timeout: i32 = @intCast(absolute_timeout - std.Io.Clock.now(.awake, client.io).toMilliseconds());
+                            if (timeout < 0) {
+                                return null;
+                            }
+                            continue :loop;
+                        },
+                        else => {
+                            std.debug.print("{any}\n", .{err});
+                            client.close();
+                            return err;
+                        },
+                    };
 
-                const res = try socket.socket.receive(client.io, buf);
-                std.debug.print("{s}\n", .{res.data});
-                return res.data.len;
+                    if (res.data.len != 0) return res.data.len;
+                }
             }
 
             // Called by our composed mqtt.Client
             pub fn write(ctx: *const Context, data: []const u8) !void {
                 var client = ctx.client;
 
-                // const absolute_timeout = std.Io.Timestamp.now(client.io, .awake).toMilliseconds() + ctx.timeout;
-
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
-                const retries = ctx.retries;
-
-                // _ = absolute_timeout;
-                _ = retries;
-
-                // TODO: understand how to integrate timeout and retries.
+                var retries = ctx.retries;
 
                 // If retries > 0 and we detect a disconnect, we'll attempt to reload the
                 // socket (hence socket is var, not const).
@@ -261,8 +271,31 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
 
                 var writer_buf: [4096]u8 = undefined;
                 var writer = socket.writer(client.io, &writer_buf);
-                try writer.interface.writeAll(data);
-                try writer.interface.flush();
+                loop: while (true) {
+                    writer.interface.writeAll(data) catch |err| switch (writer.err.?) {
+                        error.ConnectionResetByPeer => {
+                            socket = try handleError(client, &retries);
+                            continue :loop;
+                        },
+                        else => {
+                            std.debug.print("{any}\n", .{err});
+                            client.close();
+                            return err;
+                        },
+                    };
+                    writer.interface.flush() catch |err| switch (writer.err.?) {
+                        error.ConnectionResetByPeer => {
+                            socket = try handleError(client, &retries);
+                            continue :loop;
+                        },
+                        else => {
+                            std.debug.print("{any}\n", .{err});
+                            client.close();
+                            return err;
+                        },
+                    };
+                    return;
+                }
             }
 
             // Called by our composed mqtt.Client
@@ -270,7 +303,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 ctx.client.close();
             }
 
-            fn handleError(client: *Self, retries: *u16) !posix.socket_t {
+            fn handleError(client: *Self, retries: *u16) !net.Stream {
                 client.close();
                 const r = retries.*;
                 if (r == 0) {
