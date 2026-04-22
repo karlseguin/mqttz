@@ -406,32 +406,27 @@ const Address = struct {
 const t = std.testing;
 
 test {
-    const address = try net.Address.parseIp("127.0.0.1", 6588);
-    const socket = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-    errdefer posix.close(socket);
-
-    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(socket, &address.any, address.getOsSockLen());
-    try posix.listen(socket, 2);
-    const thread = try std.Thread.spawn(.{}, TestServer.run, .{socket});
+    const addr = try net.IpAddress.parseIp4("127.0.0.1", 6588);
+    var serv = try addr.listen(t.io, .{ .reuse_address = true, .mode = .stream, .protocol = .tcp });
+    const thread = try std.Thread.spawn(.{}, TestServer.run, .{&serv});
     thread.detach();
 }
 
 test "Client: invalid config" {
-    try t.expectError(error.HostOrIPRequired, Client.init(.{ .port = 0, .allocator = t.allocator }));
+    try t.expectError(error.HostOrIPRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .allocator = t.allocator }));
 
     // host specified
-    try t.expectError(error.AllocatorRequired, Client.init(.{ .port = 0, .host = "123", .read_buf = &[_]u8{}, .write_buf = &[_]u8{} }));
+    try t.expectError(error.AllocatorRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .host = "123", .read_buf = &[_]u8{}, .write_buf = &[_]u8{} }));
 
     // no read_buf
-    try t.expectError(error.AllocatorRequired, Client.init(.{ .port = 0, .ip = "", .write_buf = &[_]u8{} }));
+    try t.expectError(error.AllocatorRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .ip = "", .write_buf = &[_]u8{} }));
 
     // no write_buf
-    try t.expectError(error.AllocatorRequired, Client.init(.{ .port = 0, .ip = "", .read_buf = &[_]u8{} }));
+    try t.expectError(error.AllocatorRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .ip = "", .read_buf = &[_]u8{} }));
 }
 
 test "Client: connect timeout" {
-    var client = try Client.init(.{
+    var client = try Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{
         .port = 1883,
         .ip = "10.255.255.1", // unroutable
         .connect_timeout = 10,
@@ -440,10 +435,10 @@ test "Client: connect timeout" {
 
     defer client.deinit();
 
-    const start = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(t.io, .awake).toMilliseconds();
     try t.expectError(error.Timeout, client.connect(.{}, .{}));
 
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = std.Io.Timestamp.now(t.io, .awake).toMilliseconds() - start;
     try t.expectEqual(true, elapsed >= 10 and elapsed < 15);
 }
 
@@ -469,7 +464,7 @@ test "Client: retry1 - no alloc" {
     // so long as the correct initialize arguments are included
 
     var buf: [128]u8 = undefined;
-    var client = try Client.init(.{
+    var client = try Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{
         .port = 6588,
         .ip = "127.0.0.1",
         .read_buf = &buf, // should not be the same!
@@ -497,9 +492,9 @@ test "Client: read timeout" {
 
     _ = try client.publish(.{}, .{ .topic = "timeout", .message = "" });
 
-    const start = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(t.io, .awake).toMilliseconds();
     try t.expectEqual(null, try client.readPacket(.{ .retries = 0, .timeout = 50 }));
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = std.Io.Timestamp.now(t.io, .awake).toMilliseconds() - start;
     try t.expectEqual(true, elapsed >= 50 and elapsed < 100);
 }
 
@@ -516,21 +511,16 @@ test "Client: read invalid response" {
 const TestServer = struct {
     // runs in a thread, but our TestServer itself is single threaded as, currently,
     // each test only needs 1 connection to the server at a time.
-    fn run(server: posix.socket_t) void {
+    fn run(server: *net.Server) !void {
         var state = State{};
 
         while (true) {
-            var address: std.net.Address = undefined;
-            var address_len: posix.socklen_t = @sizeOf(std.net.Address);
-            const socket = posix.accept(server, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-                std.debug.print("failed to accept socket: {}", .{err});
-                continue;
-            };
-            defer posix.close(socket);
+            const socket = try server.accept(t.io);
+            defer socket.close(t.io);
 
             var conn = TestConn{
                 .buf = undefined,
-                .socket = socket,
+                .socket = socket.socket.handle,
             };
             conn.handle(&state) catch |err| {
                 std.debug.print("TestConn handle: {}\n", .{err});
@@ -565,7 +555,7 @@ const TestConn = struct {
     fn handle(self: *TestConn, state: *TestServer.State) !void {
         if (std.mem.eql(u8, state.name, "retry1")) {
             state.name = "";
-            const reply = try codec.encodePublish(&self.buf, 0, .{ .topic = "retry1-ok", .message = "" });
+            const reply = try codec.encodePublish(&self.buf, .{ .mqtt_3_1_1 = true }, 0, .{ .topic = "retry1-ok", .message = "" });
             _ = try posix.write(self.socket, reply);
         } else if (std.mem.eql(u8, state.name, "retry2-a")) {
             // move the state forward, and close the connection to see if it'll retry again
@@ -573,7 +563,7 @@ const TestConn = struct {
             return;
         } else if (std.mem.eql(u8, state.name, "retry2-b")) {
             state.name = "";
-            const reply = try codec.encodePublish(&self.buf, 0, .{ .topic = "retry2-ok", .message = "" });
+            const reply = try codec.encodePublish(&self.buf, .{ .mqtt_3_1_1 = true }, 0, .{ .topic = "retry2-ok", .message = "" });
             _ = try posix.write(self.socket, reply);
         }
 
@@ -607,7 +597,7 @@ const TestConn = struct {
                     }
 
                     if (std.mem.eql(u8, p.topic, "timeout")) {
-                        std.Thread.sleep(std.time.ns_per_ms * 75);
+                        std.Io.sleep(t.io, .fromNanoseconds(std.time.ns_per_ms * 75), .awake) catch {};
                         continue;
                     }
 
@@ -646,7 +636,7 @@ const TestConn = struct {
             try self.readFill(missing);
             const b1 = buf[0];
             const data = buf[1 + length_of_len .. 1 + length_of_len + remaining_len];
-            return mqttz.Packet.decode(b1, data);
+            return mqttz.Packet.decode(b1, data, .{ .mqtt_3_1_1 = true });
         }
     }
 
@@ -668,7 +658,7 @@ const TestConn = struct {
 
 fn testClient(opts: anytype) Client(.mqtt_5_0) {
     _ = opts; // not currently used
-    return Client(.mqtt_5_0).init(.{
+    return Client(.mqtt_5_0).init(t.io, .{
         .port = 6588,
         .ip = "127.0.0.1",
         .allocator = t.allocator,

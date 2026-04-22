@@ -7,6 +7,7 @@ pub const system = posix.system;
 const native_os = builtin.os.tag;
 
 pub const fd_t = posix.fd_t;
+pub const socket_t = posix.socket_t;
 pub const SOCK = posix.SOCK;
 pub const pollfd = system.pollfd;
 pub const POLL = posix.POLL;
