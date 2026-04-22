@@ -3,7 +3,7 @@ const mqttz = @import("mqtt.zig");
 const builtin = @import("builtin");
 
 const net = std.Io.net;
-const posix = std.posix;
+const posix = @import("posix_interface.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Client5 = Client(.mqtt_5_0);
@@ -216,11 +216,10 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 timeout: i32 = 10_000,
             };
 
-            // Called by our composed mqtt.Client(T)
             pub fn read(ctx: *const Context, buf: []u8, _: usize) !?usize {
                 var client = ctx.client;
 
-                // const absolute_timeout = std.Io.Clock.now(.awake, client.io).toMilliseconds() + ctx.timeout;
+                const absolute_timeout = std.Io.Timestamp.now(client.io, .awake).toMilliseconds() + ctx.timeout;
 
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
@@ -229,38 +228,54 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 // If retries > 0 and we detect a disconnect, we'll attempt to reload the
                 // socket (hence socket is var, not const).
                 var socket = try client.getOrConnectSocket();
-                var reader_buf: [4096]u8 = undefined;
-                var socket_reader = socket.reader(client.io, &reader_buf);
-                var buf_writer = std.Io.Writer.fixed(buf);
-                loop: while (true) {
-                    const res = socket_reader.interface.stream(&buf_writer, .unlimited) catch |err| switch (socket_reader.err.?) {
-                        error.ConnectionResetByPeer => {
-                            socket = try handleError(client, &retries);
-                            continue :loop;
-                        },
-                        // error.Timeout => {
-                        //     const timeout: i32 = @intCast(absolute_timeout - std.Io.Clock.now(.awake, client.io).toMilliseconds());
-                        //     if (timeout < 0) {
-                        //         return null;
-                        //     }
-                        //     continue :loop;
-                        // },
-                        else => {
-                            std.debug.print("{any}\n", .{err});
-                            client.close();
-                            return err;
-                        },
-                    };
-                    try buf_writer.flush();
 
-                    if (res != 0) return res;
-                    continue :loop;
+                loop: while (true) {
+                    const n = posix.read(socket.socket.handle, buf) catch |err| {
+                        switch (err) {
+                            error.BrokenPipe, error.ConnectionResetByPeer => {
+                                socket = try handleError(client, &retries);
+                                continue :loop;
+                            },
+                            error.WouldBlock => {
+                                const timeout: i32 = @intCast(absolute_timeout - std.Io.Timestamp.now(client.io, .awake).toMilliseconds());
+                                if (timeout < 0) {
+                                    return null;
+                                }
+
+                                var fds = [1]posix.pollfd{.{ .fd = socket.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
+                                if (try posix.poll(&fds, timeout) == 0) {
+                                    return null;
+                                }
+
+                                if (fds[0].revents & posix.POLL.IN != posix.POLL.IN) {
+                                    // handle any other non-POLLOUT event as an error
+                                    socket = try handleError(client, &retries);
+                                }
+
+                                // Either poll has told us we can read without blocking OR
+                                // poll told us there was a error, but retries > 0 and we managed
+                                // to reconnect. Either way, we're gonna try to read again.
+                                continue :loop;
+                            },
+                            else => {
+                                client.close();
+                                return err;
+                            },
+                        }
+                    };
+
+                    if (n != 0) {
+                        return n;
+                    }
+
+                    socket = try handleError(client, &retries);
                 }
             }
 
-            // Called by our composed mqtt.Client
             pub fn write(ctx: *const Context, data: []const u8) !void {
                 var client = ctx.client;
+
+                const absolute_timeout = std.Io.Timestamp.now(client.io, .awake).toMilliseconds() + ctx.timeout;
 
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
@@ -270,11 +285,35 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 // socket (hence socket is var, not const).
                 var socket = try client.getOrConnectSocket();
 
-                var writer_buf: [4096]u8 = undefined;
-                var writer = socket.writer(client.io, &writer_buf);
-                loop: while (true) {
-                    writer.interface.writeAll(data) catch |err| switch (writer.err.?) {
-                        error.ConnectionResetByPeer => {
+                // position in data that we've written to so far (or, put differently,
+                // positition in data that our next write starts at)
+                var pos: usize = 0;
+
+                loop: while (pos < data.len) {
+                    pos += posix.write(socket.socket.handle, data[pos..]) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            const timeout: i32 = @intCast(std.Io.Timestamp.now(client.io, .awake).toMilliseconds() - absolute_timeout);
+                            if (timeout < 0) {
+                                return error.Timeout;
+                            }
+
+                            var fds = [1]posix.pollfd{.{ .fd = socket.socket.handle, .events = posix.POLL.OUT, .revents = 0 }};
+                            if (try posix.poll(&fds, timeout) == 0) {
+                                return error.Timeout;
+                            }
+
+                            const revents = fds[0].revents;
+                            if (revents & posix.POLL.OUT != posix.POLL.OUT) {
+                                // handle any other non-POLLOUT event as an error
+                                socket = try handleError(client, &retries);
+                            }
+
+                            // Either poll has told us we can write without blocking OR
+                            // poll told us there was a error, but retries > 0 and we managed
+                            // to reconnect. Either way, we're gonna try to write again.
+                            continue :loop;
+                        },
+                        error.BrokenPipe, error.ConnectionResetByPeer => {
                             socket = try handleError(client, &retries);
                             continue :loop;
                         },
@@ -283,17 +322,6 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                             return err;
                         },
                     };
-                    writer.interface.flush() catch |err| switch (writer.err.?) {
-                        error.ConnectionResetByPeer => {
-                            socket = try handleError(client, &retries);
-                            continue :loop;
-                        },
-                        else => {
-                            client.close();
-                            return err;
-                        },
-                    };
-                    return;
                 }
             }
 
@@ -351,7 +379,10 @@ const Address = struct {
         _ = timeout; // TODO: check how to set the timeout on the socket in 0.16.
 
         if (self.address) |addr| {
-            return try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+            const stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+
+            try makeStreamAsync(&stream);
+            return stream;
         }
 
         // If we don't have an address, then we were given a host:ip.
@@ -359,7 +390,16 @@ const Address = struct {
         // IPs, hence why we don't convert host:ip -> net.Address in init.
         const host = self.host.?;
         const host_name = try std.Io.net.HostName.init(host.name);
-        return try host_name.connect(self.io, self.host.?.port, .{ .mode = .stream, .protocol = .tcp });
+        const stream = try host_name.connect(self.io, self.host.?.port, .{ .mode = .stream, .protocol = .tcp });
+
+        try makeStreamAsync(&stream);
+        return stream;
+    }
+
+    fn makeStreamAsync(stream: *const net.Stream) !void {
+        const fd = stream.socket.handle;
+        const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        _ = try posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")));
     }
 };
 

@@ -2820,7 +2820,7 @@ const TestContext = struct {
     fn random(self: *TestContext) std.Random {
         if (self._random == null) {
             var seed: u64 = undefined;
-            std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+            std.Io.random(t.io, std.mem.asBytes(&seed));
             self._random = std.Random.DefaultPrng.init(seed);
         }
         return self._random.?.random();
