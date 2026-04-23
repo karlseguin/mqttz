@@ -406,9 +406,10 @@ const Address = struct {
 const t = std.testing;
 
 test {
+    const io = t.io;
     const addr = try net.IpAddress.parseIp4("127.0.0.1", 6588);
-    var serv = try addr.listen(t.io, .{ .reuse_address = true, .mode = .stream, .protocol = .tcp });
-    const thread = try std.Thread.spawn(.{}, TestServer.run, .{&serv});
+    var serv = try addr.listen(io, .{ .reuse_address = true });
+    const thread = try std.Thread.spawn(.{}, TestServer.run, .{ io, &serv });
     thread.detach();
 }
 
@@ -511,12 +512,12 @@ test "Client: read invalid response" {
 const TestServer = struct {
     // runs in a thread, but our TestServer itself is single threaded as, currently,
     // each test only needs 1 connection to the server at a time.
-    fn run(server: *net.Server) !void {
+    fn run(io: std.Io, server: *net.Server) !void {
         var state = State{};
 
         while (true) {
-            const socket = try server.accept(t.io);
-            defer socket.close(t.io);
+            const socket = try server.accept(io);
+            defer socket.close(io);
 
             var conn = TestConn{
                 .buf = undefined,
