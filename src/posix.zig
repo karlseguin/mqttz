@@ -188,7 +188,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
 
         fn getOrConnectSocket(self: *Self) !net.Stream {
             return self.socket orelse {
-                const socket = try self.address.connect(self.allocator, self.connect_timeout);
+                const socket = try self.address.connect(self.connect_timeout);
                 self.socket = socket;
                 return socket;
             };
@@ -292,7 +292,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 loop: while (pos < data.len) {
                     pos += posix.write(socket.socket.handle, data[pos..]) catch |err| switch (err) {
                         error.WouldBlock => {
-                            const timeout: i32 = @intCast(std.Io.Timestamp.now(client.io, .awake).toMilliseconds() - absolute_timeout);
+                            const timeout: i32 = @intCast(absolute_timeout - std.Io.Timestamp.now(client.io, .awake).toMilliseconds());
                             if (timeout < 0) {
                                 return error.Timeout;
                             }
@@ -374,9 +374,8 @@ const Address = struct {
         return .{ .io = io, .host = .{ .name = host, .port = port } };
     }
 
-    fn connect(self: *Address, allocator: ?Allocator, timeout: i32) !net.Stream {
-        _ = allocator;
-        _ = timeout; // TODO: check how to set the timeout on the socket in 0.16.
+    fn connect(self: *Address, timeout: i32) !net.Stream {
+        _ = timeout;
 
         if (self.address) |addr| {
             const stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });

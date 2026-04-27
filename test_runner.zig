@@ -1,3 +1,17 @@
+// This is for the Zig 0.16.
+
+// See https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/eb15512d6ae49663fa9df6c7a9725b20dab43edd
+// for a version that workson Zig 0.15.2.
+
+// See https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/1f317ebc9cd09bc50fd5591d09c34255e15d1d85
+// for a version that workson Zig 0.14.1.
+
+// in your build.zig, you can specify a custom test runner:
+// const tests = b.addTest(.{
+//    .root_module = $MODULE_BEING_TESTED,
+//    .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
+// });
+
 // in your build.zig, you can specify a custom test runner:
 // const tests = b.addTest(.{
 //    .root_module = $MODULE_BEING_TESTED,
@@ -5,6 +19,7 @@
 // });
 
 const std = @import("std");
+const Io = std.Io;
 const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
@@ -20,10 +35,17 @@ pub fn main(init: std.process.Init) !void {
 
     const allocator = fba.allocator();
 
-    const env = Env.init(allocator, init.minimal);
-    defer env.deinit(allocator);
+    const env = Env.init(init.environ_map);
 
-    var slowest = SlowTracker.init(init.io, allocator, 5);
+    std.testing.io_instance = .init(init.gpa, .{
+        .argv0 = .init(init.minimal.args),
+        .environ = init.minimal.environ,
+    });
+    defer std.testing.io_instance.deinit();
+
+    const io = std.testing.io;
+
+    var slowest = SlowTracker.init(allocator, io, 5);
     defer slowest.deinit();
 
     var pass: usize = 0;
@@ -48,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         var status = Status.pass;
-        slowest.startTiming();
+        slowest.startTiming(io);
 
         const is_unnamed_test = isUnnamed(t);
         if (env.filter) |f| {
@@ -74,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         const result = t.func();
         current_test = null;
 
-        const ns_taken = slowest.endTiming(friendly_name);
+        const ns_taken = slowest.endTiming(io, friendly_name);
 
         if (std.testing.allocator_instance.deinit() == .leak) {
             leak += 1;
@@ -92,7 +114,9 @@ pub fn main(init: std.process.Init) !void {
                 status = .fail;
                 fail += 1;
                 Printer.status(.fail, "\n{s}\n\"{s}\" - {s}\n{s}\n", .{ BORDER, friendly_name, @errorName(err), BORDER });
-                std.debug.dumpCurrentStackTrace(.{});
+                if (@errorReturnTrace()) |trace| {
+                    std.debug.dumpErrorReturnTrace(trace);
+                }
                 if (env.fail_first) {
                     break;
                 }
@@ -155,28 +179,27 @@ const Status = enum {
 };
 
 const SlowTracker = struct {
-    const SlowestQueue = std.PriorityDequeue(TestInfo, void, compareTiming);
-    allocator: std.mem.Allocator,
-    io: std.Io,
     max: usize,
     slowest: SlowestQueue,
-    timer: std.Io.Timestamp,
+    start: Io.Timestamp,
+    allocator: Allocator,
 
-    fn init(io: std.Io, allocator: Allocator, count: u32) SlowTracker {
-        const timer = std.Io.Timestamp.now(io, .awake);
-        var slowest = SlowestQueue.empty;
+    const SlowestQueue = std.PriorityDequeue(TestInfo, void, compareTiming);
+
+    fn init(allocator: Allocator, io: Io, count: u32) SlowTracker {
+        const timestamp = Io.Clock.awake.now(io);
+        var slowest: SlowestQueue = .empty;
         slowest.ensureTotalCapacity(allocator, count) catch @panic("OOM");
         return .{
-            .allocator = allocator,
-            .io = io,
             .max = count,
-            .timer = timer,
+            .start = timestamp,
             .slowest = slowest,
+            .allocator = allocator,
         };
     }
 
     const TestInfo = struct {
-        ns: i96,
+        ns: u64,
         name: []const u8,
     };
 
@@ -184,12 +207,15 @@ const SlowTracker = struct {
         self.slowest.deinit(self.allocator);
     }
 
-    fn startTiming(self: *SlowTracker) void {
-        self.timer = std.Io.Timestamp.now(self.io, .awake);
+    fn startTiming(self: *SlowTracker, io: Io) void {
+        self.start = Io.Clock.awake.now(io);
     }
 
-    fn endTiming(self: *SlowTracker, test_name: []const u8) i96 {
-        const ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds() - self.timer.toNanoseconds();
+    fn endTiming(self: *SlowTracker, io: Io, test_name: []const u8) u64 {
+        const timestamp = Io.Clock.awake.now(io);
+        const start = self.start;
+        self.start = timestamp;
+        const ns: u64 = @intCast(start.durationTo(timestamp).toNanoseconds());
 
         var slowest = &self.slowest;
 
@@ -233,40 +259,24 @@ const SlowTracker = struct {
 };
 
 const Env = struct {
-    env: std.process.Init.Minimal,
     verbose: bool,
     fail_first: bool,
     filter: ?[]const u8,
 
-    fn init(allocator: Allocator, env: std.process.Init.Minimal) Env {
+    fn init(map: *const std.process.Environ.Map) Env {
         return .{
-            .env = env,
-            .verbose = readEnvBool(allocator, env, "TEST_VERBOSE", true),
-            .fail_first = readEnvBool(allocator, env, "TEST_FAIL_FIRST", false),
-            .filter = readEnv(allocator, env, "TEST_FILTER"),
+            .verbose = readEnvBool(map, "TEST_VERBOSE", true),
+            .fail_first = readEnvBool(map, "TEST_FAIL_FIRST", false),
+            .filter = readEnv(map, "TEST_FILTER"),
         };
     }
 
-    fn deinit(self: Env, allocator: Allocator) void {
-        if (self.filter) |f| {
-            allocator.free(f);
-        }
+    fn readEnv(map: *const std.process.Environ.Map, key: []const u8) ?[]const u8 {
+        return map.get(key);
     }
 
-    fn readEnv(allocator: Allocator, env: std.process.Init.Minimal, key: []const u8) ?[]const u8 {
-        const v = env.environ.getAlloc(allocator, key) catch |err| {
-            if (err == error.EnvironmentVariableNotFound) {
-                return null;
-            }
-            std.log.warn("failed to get env var {s} due to err {}", .{ key, err });
-            return null;
-        };
-        return v;
-    }
-
-    fn readEnvBool(allocator: Allocator, env: std.process.Init.Minimal, key: []const u8, deflt: bool) bool {
-        const value = readEnv(allocator, env, key) orelse return deflt;
-        defer allocator.free(value);
+    fn readEnvBool(map: *const std.process.Environ.Map, key: []const u8, deflt: bool) bool {
+        const value = readEnv(map, key) orelse return deflt;
         return std.ascii.eqlIgnoreCase(value, "true");
     }
 };
