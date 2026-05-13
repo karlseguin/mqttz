@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
 
     var client = try mqttz.posix.Client5.init(init.io, .{
         .port = 1883,
-        .host = "test.mosquitto.org",
+        .host = "localhost",
         // It IS possible to use the posix client without an allocator, see readme
         .allocator = allocator,
     });

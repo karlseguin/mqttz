@@ -356,6 +356,9 @@ const Address = struct {
     // initially null when we're given a host:port
     address: ?net.IpAddress = null,
 
+    _mutex: std.Io.Mutex = .init,
+    _cond: std.Io.Condition = .init,
+
     const Host = struct {
         port: u16,
         name: []const u8,
@@ -375,27 +378,50 @@ const Address = struct {
     }
 
     fn connect(self: *Address, timeout: i32) !net.Stream {
-        _ = timeout;
+        const io = self.io;
+        const deadline = @as(i64, @intCast(timeout)) * std.time.ns_per_ms;
+        const start = std.Io.Timestamp.now(io, .awake);
 
-        if (self.address) |addr| {
-            const stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+        try self._mutex.lock(io);
+        errdefer self._mutex.unlock(io);
 
-            try makeStreamAsync(&stream);
-            return stream;
+        const SelectResult = union(enum) { t: std.Io.Cancelable!void, c: std.Io.Cancelable!void };
+        var select_buf: [1]SelectResult = undefined;
+
+        var stream: ?std.Io.net.Stream = null;
+        while (true) {
+            if (self.address) |addr| {
+                stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+
+                try makeStreamAsync(&stream.?);
+            }
+
+            const host = self.host.?;
+            const host_name = try std.Io.net.HostName.init(host.name);
+            stream = try host_name.connect(self.io, self.host.?.port, .{ .mode = .stream, .protocol = .tcp });
+            try makeStreamAsync(&stream.?);
+
+            // Calculate remeaning timeout.
+            const now = std.Io.Timestamp.now(io, .awake);
+            const elapsed = start.durationTo(now).toNanoseconds();
+            if (elapsed >= deadline) {
+                return error.Timeout;
+            }
+
+            const remaining_ns = deadline - elapsed;
+
+            var select: std.Io.Select(SelectResult) = .init(io, &select_buf);
+            defer select.cancelDiscard();
+            try select.concurrent(.t, std.Io.sleep, .{ io, .fromNanoseconds(remaining_ns), .awake });
+            try select.concurrent(.c, std.Io.Condition.wait, .{ &self._cond, io, &self._mutex });
+
+            _ = try select.await();
+
+            return stream.?;
         }
-
-        // If we don't have an address, then we were given a host:ip.
-        // The address can change (DNS can be updated), and there can be multiple
-        // IPs, hence why we don't convert host:ip -> net.Address in init.
-        const host = self.host.?;
-        const host_name = try std.Io.net.HostName.init(host.name);
-        const stream = try host_name.connect(self.io, self.host.?.port, .{ .mode = .stream, .protocol = .tcp });
-
-        try makeStreamAsync(&stream);
-        return stream;
     }
 
-    fn makeStreamAsync(stream: *const net.Stream) !void {
+    fn makeStreamAsync(stream: *net.Stream) !void {
         const fd = stream.socket.handle;
         const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
         _ = try posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")));
