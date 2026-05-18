@@ -356,9 +356,6 @@ const Address = struct {
     // initially null when we're given a host:port
     address: ?net.IpAddress = null,
 
-    _mutex: std.Io.Mutex = .init,
-    _cond: std.Io.Condition = .init,
-
     const Host = struct {
         port: u16,
         name: []const u8,
@@ -368,7 +365,6 @@ const Address = struct {
         if (optional_ip) |ip| {
             return .{
                 .io = io,
-                // setting a future resolved means, on connect/reconnect we won't try to
                 .address = try std.Io.net.IpAddress.parseIp4(ip, port),
             };
         }
@@ -378,47 +374,20 @@ const Address = struct {
     }
 
     fn connect(self: *Address, timeout: i32) !net.Stream {
-        const io = self.io;
-        const deadline = @as(i64, @intCast(timeout)) * std.time.ns_per_ms;
-        const start = std.Io.Timestamp.now(io, .awake);
+        _ = timeout; // TODO: 0.16's std.Io.net.{IpAddress,HostName}.connect don't expose a timeout
 
-        try self._mutex.lock(io);
-        errdefer self._mutex.unlock(io);
-
-        const SelectResult = union(enum) { t: std.Io.Cancelable!void, c: std.Io.Cancelable!void };
-        var select_buf: [1]SelectResult = undefined;
-
-        var stream: ?std.Io.net.Stream = null;
-        while (true) {
-            if (self.address) |addr| {
-                stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
-
-                try makeStreamAsync(&stream.?);
-            }
-
-            const host = self.host.?;
-            const host_name = try std.Io.net.HostName.init(host.name);
-            stream = try host_name.connect(self.io, self.host.?.port, .{ .mode = .stream, .protocol = .tcp });
-            try makeStreamAsync(&stream.?);
-
-            // Calculate remeaning timeout.
-            const now = std.Io.Timestamp.now(io, .awake);
-            const elapsed = start.durationTo(now).toNanoseconds();
-            if (elapsed >= deadline) {
-                return error.Timeout;
-            }
-
-            const remaining_ns = deadline - elapsed;
-
-            var select: std.Io.Select(SelectResult) = .init(io, &select_buf);
-            defer select.cancelDiscard();
-            try select.concurrent(.t, std.Io.sleep, .{ io, .fromNanoseconds(remaining_ns), .awake });
-            try select.concurrent(.c, std.Io.Condition.wait, .{ &self._cond, io, &self._mutex });
-
-            _ = try select.await();
-
-            return stream.?;
+        if (self.address) |addr| {
+            var stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+            try makeStreamAsync(&stream);
+            return stream;
         }
+
+        // host:port — HostName.connect handles resolution and iterating addrs internally
+        const host = self.host.?;
+        const host_name = try std.Io.net.HostName.init(host.name);
+        var stream = try host_name.connect(self.io, host.port, .{ .mode = .stream, .protocol = .tcp });
+        try makeStreamAsync(&stream);
+        return stream;
     }
 
     fn makeStreamAsync(stream: *net.Stream) !void {

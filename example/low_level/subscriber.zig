@@ -9,7 +9,7 @@ const mqttz = @import("mqttz");
 // we mostly know what type of packets to expect when we call readPacket.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const host_name = try std.Io.net.HostName.init("test.mosquitto.org");
+    const host_name = try std.Io.net.HostName.init("127.0.0.1");
 
     const stream = try host_name.connect(io, 1883, .{ .mode = .stream, .protocol = .tcp });
     // will get closed when client.disconnect() is closed

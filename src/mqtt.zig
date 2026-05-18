@@ -1582,7 +1582,8 @@ test "Client: connect" {
             'e', '-',
             'c', 'l',
             'i', 'e',
-            'n', 't',
+            'n',
+            't',
 
             // WILL properties
             51, // will length
