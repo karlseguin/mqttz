@@ -2,8 +2,8 @@ const std = @import("std");
 const mqttz = @import("mqtt.zig");
 const builtin = @import("builtin");
 
-const net = std.net;
-const posix = std.posix;
+const net = std.Io.net;
+const posix = @import("posix_interface.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Client5 = Client(.mqtt_5_0);
@@ -12,6 +12,7 @@ pub const Client311NoCheck = Client(.{ .mqtt_3_1_1 = false });
 
 pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
     return struct {
+        io: std.Io,
         // our posix client is a wrapper around the platform-agnostic mqttz.Mqtt client
         // we'll provide  read, write and close implementations (based around std.posix)
         // as well as other higher level functionality.
@@ -33,7 +34,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
 
         // set when connect is called, can be unset on error (indicating that we need
         // to reconnect)
-        socket: ?posix.socket_t,
+        socket: ?net.Stream,
 
         default_retries: u16,
         default_timeout: i32,
@@ -68,7 +69,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
 
         const Self = @This();
 
-        pub fn init(opts: Opts) !Self {
+        pub fn init(io: std.Io, opts: Opts) !Self {
             const allocator = opts.allocator;
 
             if (allocator == null and (opts.ip == null or opts.read_buf == null or opts.write_buf == null)) {
@@ -91,9 +92,10 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
             }
             errdefer if (write_buf_own) allocator.?.free(write_buf.?);
 
-            const address = try Address.init(opts.host, opts.ip, opts.port);
+            const address = try Address.init(io, opts.host, opts.ip, opts.port);
 
             return .{
+                .io = io,
                 .socket = null,
                 .address = address,
                 .allocator = allocator,
@@ -184,9 +186,9 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
             return self.mqtt.readPacket(&self.createContext(rw));
         }
 
-        fn getOrConnectSocket(self: *Self) !posix.socket_t {
+        fn getOrConnectSocket(self: *Self) !net.Stream {
             return self.socket orelse {
-                const socket = try self.address.connect(self.allocator, self.connect_timeout);
+                const socket = try self.address.connect(self.connect_timeout);
                 self.socket = socket;
                 return socket;
             };
@@ -194,7 +196,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
 
         fn close(self: *Self) void {
             if (self.socket) |socket| {
-                posix.close(socket);
+                socket.close(self.io);
                 self.socket = null;
             }
         }
@@ -214,11 +216,10 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 timeout: i32 = 10_000,
             };
 
-            // Called by our composed mqtt.Client(T)
             pub fn read(ctx: *const Context, buf: []u8, _: usize) !?usize {
                 var client = ctx.client;
 
-                const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
+                const absolute_timeout = std.Io.Timestamp.now(client.io, .awake).toMilliseconds() + ctx.timeout;
 
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
@@ -227,20 +228,21 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 // If retries > 0 and we detect a disconnect, we'll attempt to reload the
                 // socket (hence socket is var, not const).
                 var socket = try client.getOrConnectSocket();
+
                 loop: while (true) {
-                    const n = posix.read(socket, buf) catch |err| {
+                    const n = posix.read(socket.socket.handle, buf) catch |err| {
                         switch (err) {
                             error.BrokenPipe, error.ConnectionResetByPeer => {
                                 socket = try handleError(client, &retries);
                                 continue :loop;
                             },
                             error.WouldBlock => {
-                                const timeout: i32 = @intCast(absolute_timeout - std.time.milliTimestamp());
+                                const timeout: i32 = @intCast(absolute_timeout - std.Io.Timestamp.now(client.io, .awake).toMilliseconds());
                                 if (timeout < 0) {
                                     return null;
                                 }
 
-                                var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.IN, .revents = 0 }};
+                                var fds = [1]posix.pollfd{.{ .fd = socket.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
                                 if (try posix.poll(&fds, timeout) == 0) {
                                     return null;
                                 }
@@ -270,11 +272,10 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 }
             }
 
-            // Called by our composed mqtt.Client
             pub fn write(ctx: *const Context, data: []const u8) !void {
                 var client = ctx.client;
 
-                const absolute_timeout = std.time.milliTimestamp() + ctx.timeout;
+                const absolute_timeout = std.Io.Timestamp.now(client.io, .awake).toMilliseconds() + ctx.timeout;
 
                 // on disconnect, the number of times that we'll try to reconnect and
                 // continue. This counts downwards to 0.
@@ -289,14 +290,14 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 var pos: usize = 0;
 
                 loop: while (pos < data.len) {
-                    pos += posix.write(socket, data[pos..]) catch |err| switch (err) {
+                    pos += posix.write(socket.socket.handle, data[pos..]) catch |err| switch (err) {
                         error.WouldBlock => {
-                            const timeout: i32 = @intCast(std.time.milliTimestamp() - absolute_timeout);
+                            const timeout: i32 = @intCast(absolute_timeout - std.Io.Timestamp.now(client.io, .awake).toMilliseconds());
                             if (timeout < 0) {
                                 return error.Timeout;
                             }
 
-                            var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.OUT, .revents = 0 }};
+                            var fds = [1]posix.pollfd{.{ .fd = socket.socket.handle, .events = posix.POLL.OUT, .revents = 0 }};
                             if (try posix.poll(&fds, timeout) == 0) {
                                 return error.Timeout;
                             }
@@ -329,7 +330,7 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
                 ctx.client.close();
             }
 
-            fn handleError(client: *Self, retries: *u16) !posix.socket_t {
+            fn handleError(client: *Self, retries: *u16) !net.Stream {
                 client.close();
                 const r = retries.*;
                 if (r == 0) {
@@ -347,108 +348,80 @@ pub fn Client(comptime protocol_version: mqttz.ProtocolVersion) type {
 // (a) we can handle the fact that host DNS can change and can have multiple IPs
 // (b) do a non-blocking connect (so we can timeout)
 const Address = struct {
+    io: std.Io,
+
     // null when we're given an ip:port.
     host: ?Host = null,
 
     // initially null when we're given a host:port
-    address: ?net.Address = null,
+    address: ?net.IpAddress = null,
 
     const Host = struct {
         port: u16,
         name: []const u8,
     };
 
-    fn init(optional_host: ?[]const u8, optional_ip: ?[]const u8, port: u16) !Address {
+    fn init(io: std.Io, optional_host: ?[]const u8, optional_ip: ?[]const u8, port: u16) !Address {
         if (optional_ip) |ip| {
             return .{
-                // setting a future resolved means, on connect/reconnect we won't try to
-                .address = try std.net.Address.parseIp(ip, port),
+                .io = io,
+                .address = try std.Io.net.IpAddress.parseIp4(ip, port),
             };
         }
 
         const host = optional_host orelse return error.HostOrIPRequired;
-        return .{ .host = .{ .name = host, .port = port } };
+        return .{ .io = io, .host = .{ .name = host, .port = port } };
     }
 
-    fn connect(self: *Address, allocator: ?Allocator, timeout: i32) !posix.socket_t {
+    fn connect(self: *Address, timeout: i32) !net.Stream {
+        _ = timeout; // TODO: 0.16's std.Io.net.{IpAddress,HostName}.connect don't expose a timeout
+
         if (self.address) |addr| {
-            // we were given an ip:port, so the address is fixed
-            return connectTo(addr, timeout);
+            var stream = try addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+            try makeStreamAsync(&stream);
+            return stream;
         }
 
-        // If we don't have an address, then we were given a host:ip.
-        // The address can change (DNS can be updated), and there can be multiple
-        // IPs, hence why we don't convert host:ip -> net.Address in init.
+        // host:port — HostName.connect handles resolution and iterating addrs internally
         const host = self.host.?;
-        const list = try net.getAddressList(allocator.?, host.name, host.port);
-        defer list.deinit();
-
-        if (list.addrs.len == 0) {
-            return error.UnknownHostName;
-        }
-
-        for (list.addrs) |addr| {
-            return connectTo(addr, timeout) catch continue;
-        }
-
-        return posix.ConnectError.ConnectionRefused;
+        const host_name = try std.Io.net.HostName.init(host.name);
+        var stream = try host_name.connect(self.io, host.port, .{ .mode = .stream, .protocol = .tcp });
+        try makeStreamAsync(&stream);
+        return stream;
     }
 
-    fn connectTo(addr: net.Address, timeout: i32) !posix.socket_t {
-        const sock_flags = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
-        const socket = try posix.socket(addr.any.family, sock_flags, posix.IPPROTO.TCP);
-        errdefer posix.close(socket);
-
-        posix.connect(socket, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-            error.WouldBlock => {
-                var fds = [1]posix.pollfd{.{ .fd = socket, .events = posix.POLL.OUT, .revents = 0 }};
-                if (try posix.poll(&fds, timeout) == 0) {
-                    return error.Timeout;
-                }
-
-                if (fds[0].revents & posix.POLL.OUT != posix.POLL.OUT) {
-                    return error.ConnectionRefused;
-                }
-
-                // if this returns void, then we've successfully connected
-                try posix.getsockoptError(socket);
-            },
-            else => return err,
-        };
-
-        return socket;
+    fn makeStreamAsync(stream: *net.Stream) !void {
+        const fd = stream.socket.handle;
+        const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        _ = try posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")));
     }
 };
 
 const t = std.testing;
 
 test {
-    const address = try net.Address.parseIp("127.0.0.1", 6588);
-    const socket = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-    errdefer posix.close(socket);
-
-    try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(socket, &address.any, address.getOsSockLen());
-    try posix.listen(socket, 2);
-    const thread = try std.Thread.spawn(.{}, TestServer.run, .{socket});
+    const io = t.io;
+    const addr = try net.IpAddress.parseIp4("127.0.0.1", 6588);
+    var serv = try addr.listen(io, .{ .reuse_address = true });
+    const thread = try std.Thread.spawn(.{}, TestServer.run, .{ io, &serv });
     thread.detach();
 }
 
 test "Client: invalid config" {
-    try t.expectError(error.HostOrIPRequired, Client.init(.{ .port = 0, .allocator = t.allocator }));
+    try t.expectError(error.HostOrIPRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .allocator = t.allocator }));
 
     // host specified
-    try t.expectError(error.AllocatorRequired, Client.init(.{ .port = 0, .host = "123", .read_buf = &[_]u8{}, .write_buf = &[_]u8{} }));
+    try t.expectError(error.AllocatorRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .host = "123", .read_buf = &[_]u8{}, .write_buf = &[_]u8{} }));
 
     // no read_buf
-    try t.expectError(error.AllocatorRequired, Client.init(.{ .port = 0, .ip = "", .write_buf = &[_]u8{} }));
+    try t.expectError(error.AllocatorRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .ip = "", .write_buf = &[_]u8{} }));
 
     // no write_buf
-    try t.expectError(error.AllocatorRequired, Client.init(.{ .port = 0, .ip = "", .read_buf = &[_]u8{} }));
+    try t.expectError(error.AllocatorRequired, Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{ .port = 0, .ip = "", .read_buf = &[_]u8{} }));
 }
 
 test "Client: connect timeout" {
-    var client = try Client.init(.{
+    var client = try Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{
         .port = 1883,
         .ip = "10.255.255.1", // unroutable
         .connect_timeout = 10,
@@ -457,10 +430,10 @@ test "Client: connect timeout" {
 
     defer client.deinit();
 
-    const start = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(t.io, .awake).toMilliseconds();
     try t.expectError(error.Timeout, client.connect(.{}, .{}));
 
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = std.Io.Timestamp.now(t.io, .awake).toMilliseconds() - start;
     try t.expectEqual(true, elapsed >= 10 and elapsed < 15);
 }
 
@@ -486,7 +459,7 @@ test "Client: retry1 - no alloc" {
     // so long as the correct initialize arguments are included
 
     var buf: [128]u8 = undefined;
-    var client = try Client.init(.{
+    var client = try Client(.{ .mqtt_3_1_1 = true }).init(t.io, .{
         .port = 6588,
         .ip = "127.0.0.1",
         .read_buf = &buf, // should not be the same!
@@ -514,9 +487,9 @@ test "Client: read timeout" {
 
     _ = try client.publish(.{}, .{ .topic = "timeout", .message = "" });
 
-    const start = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(t.io, .awake).toMilliseconds();
     try t.expectEqual(null, try client.readPacket(.{ .retries = 0, .timeout = 50 }));
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = std.Io.Timestamp.now(t.io, .awake).toMilliseconds() - start;
     try t.expectEqual(true, elapsed >= 50 and elapsed < 100);
 }
 
@@ -533,21 +506,16 @@ test "Client: read invalid response" {
 const TestServer = struct {
     // runs in a thread, but our TestServer itself is single threaded as, currently,
     // each test only needs 1 connection to the server at a time.
-    fn run(server: posix.socket_t) void {
+    fn run(io: std.Io, server: *net.Server) !void {
         var state = State{};
 
         while (true) {
-            var address: std.net.Address = undefined;
-            var address_len: posix.socklen_t = @sizeOf(std.net.Address);
-            const socket = posix.accept(server, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
-                std.debug.print("failed to accept socket: {}", .{err});
-                continue;
-            };
-            defer posix.close(socket);
+            const socket = try server.accept(io);
+            defer socket.close(io);
 
             var conn = TestConn{
                 .buf = undefined,
-                .socket = socket,
+                .socket = socket.socket.handle,
             };
             conn.handle(&state) catch |err| {
                 std.debug.print("TestConn handle: {}\n", .{err});
@@ -582,7 +550,7 @@ const TestConn = struct {
     fn handle(self: *TestConn, state: *TestServer.State) !void {
         if (std.mem.eql(u8, state.name, "retry1")) {
             state.name = "";
-            const reply = try codec.encodePublish(&self.buf, 0, .{ .topic = "retry1-ok", .message = "" });
+            const reply = try codec.encodePublish(&self.buf, .{ .mqtt_3_1_1 = true }, 0, .{ .topic = "retry1-ok", .message = "" });
             _ = try posix.write(self.socket, reply);
         } else if (std.mem.eql(u8, state.name, "retry2-a")) {
             // move the state forward, and close the connection to see if it'll retry again
@@ -590,7 +558,7 @@ const TestConn = struct {
             return;
         } else if (std.mem.eql(u8, state.name, "retry2-b")) {
             state.name = "";
-            const reply = try codec.encodePublish(&self.buf, 0, .{ .topic = "retry2-ok", .message = "" });
+            const reply = try codec.encodePublish(&self.buf, .{ .mqtt_3_1_1 = true }, 0, .{ .topic = "retry2-ok", .message = "" });
             _ = try posix.write(self.socket, reply);
         }
 
@@ -624,7 +592,7 @@ const TestConn = struct {
                     }
 
                     if (std.mem.eql(u8, p.topic, "timeout")) {
-                        std.Thread.sleep(std.time.ns_per_ms * 75);
+                        std.Io.sleep(t.io, .fromNanoseconds(std.time.ns_per_ms * 75), .awake) catch {};
                         continue;
                     }
 
@@ -663,7 +631,7 @@ const TestConn = struct {
             try self.readFill(missing);
             const b1 = buf[0];
             const data = buf[1 + length_of_len .. 1 + length_of_len + remaining_len];
-            return mqttz.Packet.decode(b1, data);
+            return mqttz.Packet.decode(b1, data, .{ .mqtt_3_1_1 = true });
         }
     }
 
@@ -685,7 +653,7 @@ const TestConn = struct {
 
 fn testClient(opts: anytype) Client(.mqtt_5_0) {
     _ = opts; // not currently used
-    return Client(.mqtt_5_0).init(.{
+    return Client(.mqtt_5_0).init(t.io, .{
         .port = 6588,
         .ip = "127.0.0.1",
         .allocator = t.allocator,

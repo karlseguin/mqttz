@@ -253,7 +253,6 @@ pub fn Mqtt311NoCheck(comptime T: type) type {
     return Mqtt(T, .{ .mqtt_3_1_1 = false });
 }
 
-
 pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
     return struct {
         // buffer used for reading messages from the server. If a single message
@@ -402,7 +401,9 @@ pub fn Mqtt(comptime T: type, comptime protocol_version: ProtocolVersion) type {
             try self.writePacket(state, &.{ 192, 0 });
         }
 
-        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{WriteBufferIsFull,})!void {
+        pub fn disconnect(self: *Self, state: anytype, opts: DisconnectOpts) (WriteError || error{
+            WriteBufferIsFull,
+        })!void {
             defer T.MqttPlatform.close(state);
             const disconnect_packet = try codec.encodeDisconnect(self.write_buf, protocol_version, opts);
             return self.writePacket(state, disconnect_packet);
@@ -2820,7 +2821,7 @@ const TestContext = struct {
     fn random(self: *TestContext) std.Random {
         if (self._random == null) {
             var seed: u64 = undefined;
-            std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+            std.Io.random(t.io, std.mem.asBytes(&seed));
             self._random = std.Random.DefaultPrng.init(seed);
         }
         return self._random.?.random();

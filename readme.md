@@ -3,7 +3,8 @@
 This is a embedding-friendly MQTT client library for Zig. The library has two client: a platform-agnostic low level MQTT client where you bring your own read/write/close function and a higher level client based on Zig's stdlib.
 
 ## Examples
-These example connect to [test.mosquitto.org](https://test.mosquitto.org/), so please be respectful.
+  To run the posix clients, first start a local broker:
+  `docker run --rm -p 1883:1883 eclipse-mosquitto`
 
 The `example` folder contains examples of using both clients. The low-level client is implemented using Zig's standard library. This implementation is very basic and not as feature rich as `mqtt.posix.Client5` (i.e. no timeouts) . It is only included to show how to integrate the low-level client within your own platform.
 
